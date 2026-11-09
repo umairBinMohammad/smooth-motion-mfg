@@ -1,10 +1,11 @@
-// Smooth Motion tracer (phase 1): log-only.
+// Smooth Motion tracer and phase 2 prototype.
 // SPDX-License-Identifier: MIT
 //
 // Records what NvPresent64.dll asks CUDA to do: which kernel modules it loads,
 // which kernels it launches per frame, and the parameter block of each launch.
-// It changes nothing: every hooked call is forwarded with its original
-// arguments and its result is returned untouched.
+// Every hooked call is forwarded with its original arguments. From 0.3 it also
+// inserts one kernel of its own (see "time shift" below); at t = 0.5, the
+// default, that kernel leaves the data unchanged.
 //
 // Output: smm_trace.log beside the game executable (or in %SMM_LOG_DIR%).
 
@@ -39,7 +40,7 @@ bool readable(const void* address, size_t bytes) {
 
 namespace {
 
-#define SMM_VERSION "tracer 0.2"
+#define SMM_VERSION "prototype 0.3"
 
 // ---------------------------------------------------------------- logging
 
@@ -261,6 +262,156 @@ int (*real_cuStreamEndCapture)(CUstream, CUgraph*);
 int (*real_cuArrayCreate_v2)(void**, const void*);
 int (*real_cuExternalMemoryGetMappedMipmappedArray)(void**, void*, const void*);
 
+// ------------------------------------------------------------ time shift
+//
+// Phase 2 experiment. While NvPresent records its per-frame graph, one extra
+// kernel is launched just before warp_coarse_kernel. It multiplies the flow
+// channels of the network output in place: flows into the previous frame
+// (channels 0,1,4,5) by 2t and flows into the current frame (2,3,6,7) by
+// 2(1-t). NVIDIA's own warp then builds the frame for time t instead of the
+// midpoint. At t = 0.5 both factors are 1 and the data is unchanged.
+// The factors live in device memory, so F10 can change t without re-recording.
+
+const char kScalePtx[] =
+    ".version 7.0\n"
+    ".target sm_80\n"
+    ".address_size 64\n"
+    "\n"
+    ".visible .entry smm_scale_flow(\n"
+    "    .param .u64 smm_buf,\n"
+    "    .param .u64 smm_scales,\n"
+    "    .param .u32 smm_count\n"
+    ")\n"
+    "{\n"
+    "    .reg .pred %p<2>;\n"
+    "    .reg .b16 %h<2>;\n"
+    "    .reg .f32 %f<5>;\n"
+    "    .reg .b32 %r<6>;\n"
+    "    .reg .b64 %rd<6>;\n"
+    "    ld.param.u64 %rd1, [smm_buf];\n"
+    "    ld.param.u64 %rd5, [smm_scales];\n"
+    "    ld.param.u32 %r1, [smm_count];\n"
+    "    mov.u32 %r2, %ctaid.x;\n"
+    "    mov.u32 %r3, %ntid.x;\n"
+    "    mov.u32 %r4, %tid.x;\n"
+    "    mad.lo.u32 %r5, %r2, %r3, %r4;\n"
+    "    setp.ge.u32 %p1, %r5, %r1;\n"
+    "    @%p1 bra L_end;\n"
+    "    ld.global.f32 %f1, [%rd5];\n"
+    "    ld.global.f32 %f2, [%rd5+4];\n"
+    "    cvt.u64.u32 %rd2, %r5;\n"
+    "    shl.b64 %rd3, %rd2, 5;\n"
+    "    add.u64 %rd4, %rd1, %rd3;\n"
+    "ld.global.u16 %h0, [%rd4+0];\n"
+    "cvt.f32.f16 %f3, %h0;\n"
+    "mul.f32 %f4, %f3, %f1;\n"
+    "cvt.rn.f16.f32 %h1, %f4;\n"
+    "st.global.u16 [%rd4+0], %h1;\n"
+    "ld.global.u16 %h0, [%rd4+2];\n"
+    "cvt.f32.f16 %f3, %h0;\n"
+    "mul.f32 %f4, %f3, %f1;\n"
+    "cvt.rn.f16.f32 %h1, %f4;\n"
+    "st.global.u16 [%rd4+2], %h1;\n"
+    "ld.global.u16 %h0, [%rd4+4];\n"
+    "cvt.f32.f16 %f3, %h0;\n"
+    "mul.f32 %f4, %f3, %f2;\n"
+    "cvt.rn.f16.f32 %h1, %f4;\n"
+    "st.global.u16 [%rd4+4], %h1;\n"
+    "ld.global.u16 %h0, [%rd4+6];\n"
+    "cvt.f32.f16 %f3, %h0;\n"
+    "mul.f32 %f4, %f3, %f2;\n"
+    "cvt.rn.f16.f32 %h1, %f4;\n"
+    "st.global.u16 [%rd4+6], %h1;\n"
+    "ld.global.u16 %h0, [%rd4+8];\n"
+    "cvt.f32.f16 %f3, %h0;\n"
+    "mul.f32 %f4, %f3, %f1;\n"
+    "cvt.rn.f16.f32 %h1, %f4;\n"
+    "st.global.u16 [%rd4+8], %h1;\n"
+    "ld.global.u16 %h0, [%rd4+10];\n"
+    "cvt.f32.f16 %f3, %h0;\n"
+    "mul.f32 %f4, %f3, %f1;\n"
+    "cvt.rn.f16.f32 %h1, %f4;\n"
+    "st.global.u16 [%rd4+10], %h1;\n"
+    "ld.global.u16 %h0, [%rd4+12];\n"
+    "cvt.f32.f16 %f3, %h0;\n"
+    "mul.f32 %f4, %f3, %f2;\n"
+    "cvt.rn.f16.f32 %h1, %f4;\n"
+    "st.global.u16 [%rd4+12], %h1;\n"
+    "ld.global.u16 %h0, [%rd4+14];\n"
+    "cvt.f32.f16 %f3, %h0;\n"
+    "mul.f32 %f4, %f3, %f2;\n"
+    "cvt.rn.f16.f32 %h1, %f4;\n"
+    "st.global.u16 [%rd4+14], %h1;\n"
+    "L_end:\n"
+    "    ret;\n"
+    "}\n";
+
+int (*cu_ModuleLoadDataEx)(CUmodule*, const void*, unsigned, int*, void**);
+int (*cu_MemAlloc)(uint64_t*, size_t);
+int (*cu_MemcpyHtoD)(uint64_t, const void*, size_t);
+
+constexpr float kTimes[] = {0.5f, 0.25f, 0.75f, 0.0f};
+int g_time_index = 0;
+bool g_shift_failed = false, g_time_key_down = false;
+CUfunction g_scale_function = nullptr;
+uint64_t g_scale_memory = 0;
+
+int upload_time() {
+    const float t = kTimes[g_time_index];
+    const float scales[2] = {2.0f * t, 2.0f * (1.0f - t)};
+    return cu_MemcpyHtoD(g_scale_memory, scales, sizeof(scales));
+}
+
+// Called on NvPresent's thread (CUDA context current) right before it launches warp_coarse_kernel.
+void inject_time_shift(const uint8_t* warp_params, CUstream stream) {
+    if (g_shift_failed || !cu_ModuleLoadDataEx || !cu_MemAlloc || !cu_MemcpyHtoD) return;
+    if (!g_scale_function) {
+        char errors[1024] = "";
+        int options[2] = {5, 6};  // CU_JIT_ERROR_LOG_BUFFER, CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES
+        void* values[2] = {errors, reinterpret_cast<void*>(sizeof(errors))};
+        CUmodule module = nullptr;
+        int rc = cu_ModuleLoadDataEx(&module, kScalePtx, 2, options, values);
+        if (rc == 0) rc = real_cuModuleGetFunction(&g_scale_function, module, "smm_scale_flow");
+        if (rc == 0) rc = cu_MemAlloc(&g_scale_memory, 8);
+        if (rc == 0) rc = upload_time();
+        EnterCriticalSection(&g_lock);
+        logf("time shift: kernel setup rc=%d %s", rc, errors);
+        LeaveCriticalSection(&g_lock);
+        if (rc != 0) {
+            g_shift_failed = true;
+            g_scale_function = nullptr;
+            return;
+        }
+    }
+    uint64_t buffer = rd<uint64_t>(warp_params + 16);
+    const uint32_t width = rd<uint32_t>(warp_params + 32), height = rd<uint32_t>(warp_params + 36);
+    uint32_t count = width * height;
+    if (!buffer || width != 256 || height != 144) {
+        EnterCriticalSection(&g_lock);
+        logf("time shift: unexpected coarse size %ux%u; not injected", width, height);
+        LeaveCriticalSection(&g_lock);
+        return;
+    }
+    void* params[3] = {&buffer, &g_scale_memory, &count};
+    const int rc = real_cuLaunchKernel(g_scale_function, (count + 255) / 256, 1, 1, 256, 1, 1, 0, stream, params, nullptr);
+    EnterCriticalSection(&g_lock);
+    logf("time shift: scale kernel inserted before warp (buffer=0x%llx pixels=%u t=%.2f) rc=%d%s",
+         static_cast<unsigned long long>(buffer), count, kTimes[g_time_index], rc, g_capturing ? " [recorded into graph]" : "");
+    LeaveCriticalSection(&g_lock);
+}
+
+// F10 cycles t. Called from the graph-launch hook, between frames.
+void poll_time_key() {
+    const bool key = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+    if (key && !g_time_key_down && g_scale_function) {
+        g_time_index = (g_time_index + 1) % int(sizeof(kTimes) / sizeof(kTimes[0]));
+        const int rc = upload_time();
+        logf("time shift: F10 -> t=%.2f (upload rc=%d)", kTimes[g_time_index], rc);
+        Beep(500 + 250 * g_time_index, 70);
+    }
+    g_time_key_down = key;
+}
+
 int hook_cuModuleLoadData(CUmodule* module, const void* image) {
     const int rc = real_cuModuleLoadData(module, image);
     void* ra = __builtin_return_address(0);
@@ -336,6 +487,8 @@ int hook_cuModuleGetFunction(CUfunction* function, CUmodule module, const char* 
 int hook_cuLaunchKernel(CUfunction function, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by,
                         unsigned bz, unsigned shared, CUstream stream, void** params, void** extra) {
     void* ra = __builtin_return_address(0);
+    bool is_warp = false;
+    uint8_t warp_block[136];
     EnterCriticalSection(&g_lock);
     if (!from_nvpresent(ra)) {
         note_foreign("cuLaunchKernel", ra);
@@ -348,6 +501,7 @@ int hook_cuLaunchKernel(CUfunction function, unsigned gx, unsigned gy, unsigned 
         } else {
             ++g_window_unknown;
         }
+        is_warp = f && strcmp(f->name, "warp_coarse_kernel") == 0;
         bool detail = seq < kDetailFirst || (seq % kDetailEvery) < kDetailBurst;
 
         // First kernel parameter, when its size is known and the memory is readable.
@@ -388,9 +542,12 @@ int hook_cuLaunchKernel(CUfunction function, unsigned gx, unsigned gy, unsigned 
                 }
             }
         }
+        if (is_warp && block_size >= sizeof(warp_block)) memcpy(warp_block, block, sizeof(warp_block));
+        else is_warp = false;
         summary_if_due();
     }
     LeaveCriticalSection(&g_lock);
+    if (is_warp) inject_time_shift(warp_block, stream);
     return real_cuLaunchKernel(function, gx, gy, gz, bx, by, bz, shared, stream, params, extra);
 }
 
@@ -410,6 +567,7 @@ int hook_cuGraphLaunch(CUgraph graph, CUstream stream) {
         ++g_dump_sets;
     }
     g_key_down = key;
+    poll_time_key();
     if (g_dump_pending && cu_StreamSynchronize) {
         const int sync_rc = cu_StreamSynchronize(stream);
         const double t1 = now_ms();
@@ -490,7 +648,7 @@ DWORD WINAPI bootstrap(void*) {
     open_log();
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    logf("smooth-motion-mfg " SMM_VERSION " (log only) in %ls", exe);
+    logf("smooth-motion-mfg " SMM_VERSION " in %ls (F10 cycles t = 0.5, 0.25, 0.75, 0; F9 captures)", exe);
 
     // NvPresent imports nvcuda.dll by name; loading it first lets us hook its exports
     // before NvPresent makes its first call.
@@ -510,6 +668,9 @@ DWORD WINAPI bootstrap(void*) {
     const HMODULE cuda = GetModuleHandleW(L"nvcuda.dll");
     cu_MemGetAddressRange = reinterpret_cast<decltype(cu_MemGetAddressRange)>(reinterpret_cast<void*>(GetProcAddress(cuda, "cuMemGetAddressRange_v2")));
     cu_MemcpyDtoH = reinterpret_cast<decltype(cu_MemcpyDtoH)>(reinterpret_cast<void*>(GetProcAddress(cuda, "cuMemcpyDtoH_v2")));
+    cu_ModuleLoadDataEx = reinterpret_cast<decltype(cu_ModuleLoadDataEx)>(reinterpret_cast<void*>(GetProcAddress(cuda, "cuModuleLoadDataEx")));
+    cu_MemAlloc = reinterpret_cast<decltype(cu_MemAlloc)>(reinterpret_cast<void*>(GetProcAddress(cuda, "cuMemAlloc_v2")));
+    cu_MemcpyHtoD = reinterpret_cast<decltype(cu_MemcpyHtoD)>(reinterpret_cast<void*>(GetProcAddress(cuda, "cuMemcpyHtoD_v2")));
     cu_StreamSynchronize = reinterpret_cast<decltype(cu_StreamSynchronize)>(reinterpret_cast<void*>(GetProcAddress(cuda, "cuStreamSynchronize")));
     logf("capture: F9 dumps two consecutive frames (max %d sets); helpers %s", kMaxDumpSets,
          cu_MemGetAddressRange && cu_MemcpyDtoH && cu_StreamSynchronize ? "ok" : "MISSING");

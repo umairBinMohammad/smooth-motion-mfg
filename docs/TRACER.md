@@ -1,7 +1,8 @@
-# Phase 1 tracer
+# Tracer and phase 2 prototype
 
-A log-only `version.dll` that records what `NvPresent64.dll` asks CUDA to do.
-It forwards every call unchanged and patches nothing in NvPresent or the game.
+A `version.dll` that records what `NvPresent64.dll` asks CUDA to do. It
+patches nothing in NvPresent or the game. Up to 0.2 it was log-only; from 0.3
+it also inserts one kernel of its own (below).
 
 ## What it logs (`smm_trace.log`, beside the game executable)
 
@@ -25,6 +26,25 @@ Press **F9** in game to dump two consecutive generated frames' network data
 into `smm_capture\` beside the log: the network's 256x144 output and the
 256x144 inputs. Up to 8 presses per run. Each press also logs how long the
 generation graph took on the GPU.
+
+## Time shift (prototype 0.3)
+
+While NvPresent records its per-frame graph, the DLL inserts one small kernel
+(hand-written PTX) before `warp_coarse_kernel`. It scales the network's flow
+channels so NVIDIA's warp builds the frame for time t instead of the midpoint.
+Still 2x: one generated frame per real frame, just at a different moment.
+
+**F10** cycles t, with a beep (higher pitch each step):
+
+| t | Expect |
+|---|---|
+| 0.5 (start) | Normal Smooth Motion; the data is unchanged |
+| 0.25 | Generated frame sits close to the previous real frame: uneven, slightly stuttery motion |
+| 0.75 | Close to the current real frame: uneven the other way |
+| 0 | Generated frame equals the previous real frame: looks like Smooth Motion is off |
+
+Blend weights are not adjusted yet, so some ghosting at 0.25/0.75 is expected.
+If the kernel fails to compile, the log says so and nothing is inserted.
 
 ## Use
 

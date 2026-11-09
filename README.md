@@ -33,7 +33,7 @@ First target: Ghost Recon Breakpoint (DX11), RTX 40-series, 3x.
 
 - [x] Phase 0: static inspection of driver 616.56 ([findings](docs/findings/616.56.md))
 - [ ] Phase 1: runtime tracer (log-only). Built, see [docs/TRACER.md](docs/TRACER.md); first trace done ([findings](docs/findings/616.56-trace.md)); network output decoded ([findings](docs/findings/616.56-network-output.md)): flows can be rescaled to other times
-- [ ] Phase 2: own warp kernel at time t
+- [ ] Phase 2: frames at time t. Prototype 0.3 built (F10 cycles t at 2x); in-game check pending
 - [ ] Phase 3: presenting the extra frames
 
 ## Rules for this project
