@@ -4,6 +4,12 @@ Last updated 2026-11-10. Status: phase 0 (static inspection) done for driver
 616.56, see [findings/616.56.md](findings/616.56.md). Phase 1 (runtime tracer)
 is next.
 
+**Phase 1 so far** ([trace](findings/616.56-trace.md)): NvPresent replays a
+recorded CUDA graph per frame, the network runs at a fixed 1024x576 and emits
+a 256x144 6-channel field, and the warp parameter at +48 is only a resolution
+ratio. Multi-frame now depends on decoding that field and writing our own
+warp kernel in PTX.
+
 **Phase 0 in short:** kernels are compiled only (no PTX), there is no visible
 time input, and NvPresent already paces with hardware flip metering in fixed
 batches of two. S1 as planned is out; S1b below is the new lead, and the

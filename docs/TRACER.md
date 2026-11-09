@@ -19,6 +19,13 @@ It forwards every call unchanged and patches nothing in NvPresent or the game.
 - `array create`, `external image`: sizes of the images NvPresent works on.
 - `summary launches/s: ...` every 5 seconds: launch rate per kernel.
 
+## Capture (tracer 0.2)
+
+Press **F9** in game to dump two consecutive generated frames' network data
+into `smm_capture\` beside the log: the network's 256x144 output and the
+256x144 inputs. Up to 8 presses per run. Each press also logs how long the
+generation graph took on the GPU.
+
 ## Use
 
 1. Copy `build\version.dll` next to the game's main executable.

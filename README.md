@@ -31,7 +31,7 @@ First target: Ghost Recon Breakpoint (DX11), RTX 40-series, 3x.
 ## Progress
 
 - [x] Phase 0: static inspection of driver 616.56 ([findings](docs/findings/616.56.md))
-- [ ] Phase 1: runtime tracer (log-only). Built, see [docs/TRACER.md](docs/TRACER.md); first trace pending
+- [ ] Phase 1: runtime tracer (log-only). Built, see [docs/TRACER.md](docs/TRACER.md); first trace done ([findings](docs/findings/616.56-trace.md)); buffer capture pending
 - [ ] Phase 2+: see `docs/DESIGN.md`
 
 ## Rules for this project

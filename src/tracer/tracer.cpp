@@ -39,7 +39,7 @@ bool readable(const void* address, size_t bytes) {
 
 namespace {
 
-#define SMM_VERSION "tracer 0.1"
+#define SMM_VERSION "tracer 0.2"
 
 // ---------------------------------------------------------------- logging
 
@@ -69,6 +69,8 @@ void logf(const char* format, ...) {
     WriteFile(g_log, line, DWORD(n), &written, nullptr);
 }
 
+wchar_t g_dir_early[MAX_PATH * 2];
+
 void open_log() {
     wchar_t path[MAX_PATH * 2];
     DWORD n = GetEnvironmentVariableW(L"SMM_LOG_DIR", path, MAX_PATH);
@@ -80,6 +82,7 @@ void open_log() {
         path[n++] = L'\\';
         path[n] = 0;
     }
+    lstrcpyW(g_dir_early, path);
     lstrcatW(path, L"smm_trace.log");
     g_log = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
                         FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -155,6 +158,13 @@ void note_foreign(const char* api, void* return_address) {
     logf("other-caller %s from %ls (not traced)", api, path);
 }
 
+bool from_nvpresent_quick(void* return_address) {
+    EnterCriticalSection(&g_lock);
+    const bool result = from_nvpresent(return_address);
+    LeaveCriticalSection(&g_lock);
+    return result;
+}
+
 Function* find_function(CUfunction handle) {
     for (int i = 0; i < g_function_count; ++i)
         if (g_functions[i].handle == handle) return &g_functions[i];
@@ -191,6 +201,51 @@ void summary_if_due() {
          g_window_graph_launches / seconds, g_window_unknown / seconds,
          static_cast<unsigned long long>(g_launch_seq));
     g_window_graph_launches = g_window_unknown = 0;
+}
+
+// ---------------------------------------------------------------- capture
+//
+// F9 dumps two consecutive generated frames' worth of network data to
+// smm_capture\ beside the log: the network's final output (what
+// warp_coarse_kernel reads) and the 256x144 inputs the downscale kernel wrote.
+// Read-only: one cuStreamSynchronize and two device-to-host copies per dump.
+
+int (*cu_MemGetAddressRange)(uint64_t*, size_t*, uint64_t);
+int (*cu_MemcpyDtoH)(void*, uint64_t, size_t);
+int (*cu_StreamSynchronize)(CUstream);
+
+wchar_t g_dir[MAX_PATH * 2];
+uint64_t g_ptr_output = 0, g_ptr_coarse = 0;  // from the most recent graph capture
+uint64_t g_graph_frames = 0;
+int g_dump_pending = 0, g_dump_sets = 0;
+bool g_key_down = false;
+constexpr size_t kDumpBytes = 2u << 20;
+constexpr int kMaxDumpSets = 8;
+
+void dump_buffer(const char* tag, uint64_t pointer, int set, int part) {
+    if (!pointer || !cu_MemGetAddressRange || !cu_MemcpyDtoH) return;
+    uint64_t base = 0;
+    size_t size = 0;
+    const int range_rc = cu_MemGetAddressRange(&base, &size, pointer);
+    size_t bytes = kDumpBytes;
+    if (range_rc == 0 && base + size > pointer && base + size - pointer < bytes) bytes = size_t(base + size - pointer);
+    void* host = VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!host) return;
+    const int rc = cu_MemcpyDtoH(host, pointer, bytes);
+    wchar_t path[MAX_PATH * 2 + 64];
+    swprintf(path, MAX_PATH * 2 + 64, L"%lssmm_capture\\set%d_%d_%hs.bin", g_dir, set, part, tag);
+    DWORD written = 0;
+    if (rc == 0) {
+        const HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file != INVALID_HANDLE_VALUE) {
+            WriteFile(file, host, DWORD(bytes), &written, nullptr);
+            CloseHandle(file);
+        }
+    }
+    VirtualFree(host, 0, MEM_RELEASE);
+    logf("dump set%d_%d %s ptr=0x%llx bytes=%zu alloc_base=0x%llx alloc_size=%zu range_rc=%d copy_rc=%d written=%lu",
+         set, part, tag, static_cast<unsigned long long>(pointer), bytes, static_cast<unsigned long long>(base), size,
+         range_rc, rc, written);
 }
 
 // ------------------------------------------------------------------ hooks
@@ -303,6 +358,8 @@ int hook_cuLaunchKernel(CUfunction function, unsigned gx, unsigned gy, unsigned 
             if (readable(params[0], block_size)) memcpy(block, params[0], block_size);
             else block_size = 0;
         }
+        if (f && block_size >= 24 && strcmp(f->name, "warp_coarse_kernel") == 0) g_ptr_output = rd<uint64_t>(block + 16);
+        if (f && block_size >= 112 && strcmp(f->name, "downscale_kernel") == 0) g_ptr_coarse = rd<uint64_t>(block + 104);
         if (f && block_size >= 52 && strcmp(f->name, "warp_coarse_kernel") == 0) {
             const uint32_t value = rd<uint32_t>(block + 48);
             bool seen = false;
@@ -339,15 +396,33 @@ int hook_cuLaunchKernel(CUfunction function, unsigned gx, unsigned gy, unsigned 
 
 int hook_cuGraphLaunch(CUgraph graph, CUstream stream) {
     void* ra = __builtin_return_address(0);
+    if (!from_nvpresent_quick(ra)) return real_cuGraphLaunch(graph, stream);
+    const double t0 = now_ms();
+    const int rc = real_cuGraphLaunch(graph, stream);
     EnterCriticalSection(&g_lock);
-    if (from_nvpresent(ra)) {
-        static uint64_t count = 0;
-        if (count++ < 40) logf("graph launch graph=%p stream=%p tid=%lu", graph, stream, GetCurrentThreadId());
-        ++g_window_graph_launches;
-        summary_if_due();
+    const uint64_t frame = g_graph_frames++;
+    if (frame < 40) logf("graph launch graph=%p stream=%p tid=%lu rc=%d", graph, stream, GetCurrentThreadId(), rc);
+    ++g_window_graph_launches;
+
+    const bool key = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+    if (key && !g_key_down && !g_dump_pending && g_dump_sets < kMaxDumpSets) {
+        g_dump_pending = 2;
+        ++g_dump_sets;
     }
+    g_key_down = key;
+    if (g_dump_pending && cu_StreamSynchronize) {
+        const int sync_rc = cu_StreamSynchronize(stream);
+        const double t1 = now_ms();
+        const int part = 2 - g_dump_pending;
+        logf("capture set%d_%d graph frame %llu: launch+sync %.3f ms (sync_rc=%d)", g_dump_sets, part,
+             static_cast<unsigned long long>(frame), t1 - t0, sync_rc);
+        dump_buffer("output", g_ptr_output, g_dump_sets, part);
+        dump_buffer("coarse", g_ptr_coarse, g_dump_sets, part);
+        --g_dump_pending;
+    }
+    summary_if_due();
     LeaveCriticalSection(&g_lock);
-    return real_cuGraphLaunch(graph, stream);
+    return rc;
 }
 
 int hook_cuStreamBeginCapture_v2(CUstream stream, int mode) {
@@ -367,6 +442,7 @@ int hook_cuStreamEndCapture(CUstream stream, CUgraph* graph) {
     EnterCriticalSection(&g_lock);
     if (from_nvpresent(ra)) {
         if (g_capturing) --g_capturing;
+        g_graph_frames = 0;
         logf("capture end stream=%p graph=%p rc=%d", stream, graph ? *graph : nullptr, rc);
     }
     LeaveCriticalSection(&g_lock);
@@ -426,6 +502,17 @@ DWORD WINAPI bootstrap(void*) {
         logf("MinHook failed to initialise; nothing will be traced");
         return 0;
     }
+    lstrcpyW(g_dir, g_dir_early);
+    wchar_t capture_dir[MAX_PATH * 2 + 16];
+    lstrcpyW(capture_dir, g_dir);
+    lstrcatW(capture_dir, L"smm_capture");
+    CreateDirectoryW(capture_dir, nullptr);
+    const HMODULE cuda = GetModuleHandleW(L"nvcuda.dll");
+    cu_MemGetAddressRange = reinterpret_cast<decltype(cu_MemGetAddressRange)>(reinterpret_cast<void*>(GetProcAddress(cuda, "cuMemGetAddressRange_v2")));
+    cu_MemcpyDtoH = reinterpret_cast<decltype(cu_MemcpyDtoH)>(reinterpret_cast<void*>(GetProcAddress(cuda, "cuMemcpyDtoH_v2")));
+    cu_StreamSynchronize = reinterpret_cast<decltype(cu_StreamSynchronize)>(reinterpret_cast<void*>(GetProcAddress(cuda, "cuStreamSynchronize")));
+    logf("capture: F9 dumps two consecutive frames (max %d sets); helpers %s", kMaxDumpSets,
+         cu_MemGetAddressRange && cu_MemcpyDtoH && cu_StreamSynchronize ? "ok" : "MISSING");
     hook("cuModuleLoadData", &hook_cuModuleLoadData, &real_cuModuleLoadData);
     hook("cuModuleUnload", &hook_cuModuleUnload, &real_cuModuleUnload);
     hook("cuModuleGetFunction", &hook_cuModuleGetFunction, &real_cuModuleGetFunction);
