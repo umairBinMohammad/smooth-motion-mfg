@@ -12,20 +12,26 @@ First target: Ghost Recon Breakpoint (DX11), RTX 40-series, 3x.
 |---|---|
 | `docs/DESIGN.md` | What the existing mods prove, the plan, and the open questions |
 | `tools/get_nvpresent.cmd` | Double-click: copies your installed `NvPresent64.dll` into `ref/` |
+| `docs/findings/` | What inspection found, per driver build |
 | `tools/inspect_nvpresent.py` | Offline inspector: exports, imports, CUDA kernels, pacing hooks |
+| `tools/cubin_info.py` | Parameter layout and parameter reads of one dumped kernel |
 | `tests/test_inspect.py` | Self-test for the inspector on synthetic data |
 | `ref/`, `out/` | NVIDIA files and decoded kernels. Local only, git-ignored |
 
-## Next step
+## Inspecting your own driver
 
-1. Double-click `tools\get_nvpresent.cmd`.
-2. Run the inspector (or ask Claude to):
+1. Double-click `tools\get_nvpresent.cmd` (copies `NvPresent64.dll` into `ref\`).
+2. Run:
 
    ```
    python tools\inspect_nvpresent.py ref\NvPresent64.dll --dump out\kernels > out\report.txt
    ```
 
-The report decides which generation strategy in `docs/DESIGN.md` is viable.
+## Progress
+
+- [x] Phase 0: static inspection of driver 616.56 ([findings](docs/findings/616.56.md))
+- [ ] Phase 1: runtime tracer (log-only)
+- [ ] Phase 2+: see `docs/DESIGN.md`
 
 ## Rules for this project
 

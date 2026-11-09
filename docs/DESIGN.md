@@ -1,7 +1,13 @@
 # Smooth Motion MFG: design notes
 
-Last updated 2026-11-10. Status: phase 0 (static inspection) is ready to run;
-it is blocked only on a copy of `NvPresent64.dll`.
+Last updated 2026-11-10. Status: phase 0 (static inspection) done for driver
+616.56, see [findings/616.56.md](findings/616.56.md). Phase 1 (runtime tracer)
+is next.
+
+**Phase 0 in short:** kernels are compiled only (no PTX), there is no visible
+time input, and NvPresent already paces with hardware flip metering in fixed
+batches of two. S1 as planned is out; S1b below is the new lead, and the
+tracer decides between S1b and S2.
 
 ## 1. Goal
 
@@ -128,6 +134,15 @@ it, fall back to (2).
 S1 is the goal. S2 is the fallback if Q1 or Q2 comes back negative. If both
 fail on the 4060's budget, the project stops there.
 
+Phase 0 answered Q1 and Q2 negatively for driver 616.56, which rules out S1
+as a parameter change. New candidate:
+
+**S1b: scaled warp.** Run the network once per rendered pair as now, then run
+`warp_coarse_kernel` N-1 times with its displacement scaled by 2t. Cheap (the
+warp kernel is a few hundred instructions; the network is the cost), but only
+correct for straight-line motion, and only possible if the parameter at
+warp_coarse +48 really is a displacement scale. The tracer checks this.
+
 ## 5. Planned architecture
 
 ```
@@ -150,7 +165,7 @@ Everything is in memory, recognised builds only, restored on unload.
 
 | Phase | Deliverable | Proves |
 |---|---|---|
-| 0 | Inspector report on the installed DLL (tool done) | Q1 to Q4; S1 or S2 |
+| 0 | Inspector report on the installed DLL (done, 616.56) | Q1 to Q4 answered: no PTX, no time input, flip metering present |
 | 1 | Log-only tracer build: module loads, kernel launches and presents per frame | Q5 to Q7; nothing is modified |
 | 2 | Temporal patch with a fixed `t` other than 0.5 at stock 2x | The temporal input works. At t = 0.25 the generated frame should sit visibly early |
 | 3 | Multi-frame generation, unpaced | Extra frames exist and differ from each other |
