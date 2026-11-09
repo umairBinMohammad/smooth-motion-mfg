@@ -1,0 +1,6 @@
+# NVIDIA binaries and anything decoded from them stay on this machine.
+ref/
+out/
+build/
+*.log
+__pycache__/
