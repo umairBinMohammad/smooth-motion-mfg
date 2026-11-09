@@ -15,6 +15,7 @@ First target: Ghost Recon Breakpoint (DX11), RTX 40-series, 3x.
 | `docs/findings/` | What inspection found, per driver build |
 | `tools/inspect_nvpresent.py` | Offline inspector: exports, imports, CUDA kernels, pacing hooks |
 | `tools/cubin_info.py` | Parameter layout and parameter reads of one dumped kernel |
+| `src/tracer/`, `build.sh` | Phase 1 tracer: log-only `version.dll` |
 | `tests/test_inspect.py` | Self-test for the inspector on synthetic data |
 | `ref/`, `out/` | NVIDIA files and decoded kernels. Local only, git-ignored |
 
@@ -30,7 +31,7 @@ First target: Ghost Recon Breakpoint (DX11), RTX 40-series, 3x.
 ## Progress
 
 - [x] Phase 0: static inspection of driver 616.56 ([findings](docs/findings/616.56.md))
-- [ ] Phase 1: runtime tracer (log-only)
+- [ ] Phase 1: runtime tracer (log-only). Built, see [docs/TRACER.md](docs/TRACER.md); first trace pending
 - [ ] Phase 2+: see `docs/DESIGN.md`
 
 ## Rules for this project

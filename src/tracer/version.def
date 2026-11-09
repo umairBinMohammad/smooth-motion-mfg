@@ -1,0 +1,19 @@
+LIBRARY version
+EXPORTS
+    GetFileVersionInfoA=smm_fwd_0
+    GetFileVersionInfoByHandle=smm_fwd_1
+    GetFileVersionInfoExA=smm_fwd_2
+    GetFileVersionInfoExW=smm_fwd_3
+    GetFileVersionInfoSizeA=smm_fwd_4
+    GetFileVersionInfoSizeExA=smm_fwd_5
+    GetFileVersionInfoSizeExW=smm_fwd_6
+    GetFileVersionInfoSizeW=smm_fwd_7
+    GetFileVersionInfoW=smm_fwd_8
+    VerFindFileA=smm_fwd_9
+    VerFindFileW=smm_fwd_10
+    VerInstallFileA=smm_fwd_11
+    VerInstallFileW=smm_fwd_12
+    VerLanguageNameA=smm_fwd_13
+    VerLanguageNameW=smm_fwd_14
+    VerQueryValueA=smm_fwd_15
+    VerQueryValueW=smm_fwd_16
