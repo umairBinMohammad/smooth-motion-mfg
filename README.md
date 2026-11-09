@@ -14,6 +14,7 @@ First target: Ghost Recon Breakpoint (DX11), RTX 40-series, 3x.
 | `tools/get_nvpresent.cmd` | Double-click: copies your installed `NvPresent64.dll` into `ref/` |
 | `docs/findings/` | What inspection found, per driver build |
 | `tools/inspect_nvpresent.py` | Offline inspector: exports, imports, CUDA kernels, pacing hooks |
+| `tools/analyze_capture.py` | Tests the flow reading of the network output on F9 captures |
 | `tools/cubin_info.py` | Parameter layout and parameter reads of one dumped kernel |
 | `src/tracer/`, `build.sh` | Phase 1 tracer: log-only `version.dll` |
 | `tests/test_inspect.py` | Self-test for the inspector on synthetic data |
@@ -31,8 +32,9 @@ First target: Ghost Recon Breakpoint (DX11), RTX 40-series, 3x.
 ## Progress
 
 - [x] Phase 0: static inspection of driver 616.56 ([findings](docs/findings/616.56.md))
-- [ ] Phase 1: runtime tracer (log-only). Built, see [docs/TRACER.md](docs/TRACER.md); first trace done ([findings](docs/findings/616.56-trace.md)); buffer capture pending
-- [ ] Phase 2+: see `docs/DESIGN.md`
+- [ ] Phase 1: runtime tracer (log-only). Built, see [docs/TRACER.md](docs/TRACER.md); first trace done ([findings](docs/findings/616.56-trace.md)); network output decoded ([findings](docs/findings/616.56-network-output.md)): flows can be rescaled to other times
+- [ ] Phase 2: own warp kernel at time t
+- [ ] Phase 3: presenting the extra frames
 
 ## Rules for this project
 
