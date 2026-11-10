@@ -40,7 +40,7 @@ bool readable(const void* address, size_t bytes) {
 
 namespace {
 
-#define SMM_VERSION "prototype 0.3"
+#define SMM_VERSION "prototype 0.3.1"
 
 // ---------------------------------------------------------------- logging
 
@@ -362,22 +362,79 @@ int upload_time() {
     return cu_MemcpyHtoD(g_scale_memory, scales, sizeof(scales));
 }
 
+int (*cu_CtxGetCurrent)(void**);
+int (*cu_CtxPushCurrent)(void*);
+int (*cu_CtxPopCurrent)(void**);
+
+struct SetupJob {
+    void* context;
+    int rc;
+    const char* step;
+    char errors[1024];
+};
+
+void step_log(const char* text) {
+    EnterCriticalSection(&g_lock);
+    logf("time shift: %s", text);
+    LeaveCriticalSection(&g_lock);
+}
+
+// Runs on its own thread with a large stack: the driver's PTX compiler is not
+// safe to run on NvPresent's worker thread (0.3 died inside this call there).
+DWORD WINAPI setup_thread(void* argument) {
+    auto* job = static_cast<SetupJob*>(argument);
+    job->step = "push context";
+    step_log("setup thread started");
+    job->rc = cu_CtxPushCurrent(job->context);
+    if (job->rc != 0) return 0;
+    int options[2] = {5, 6};  // CU_JIT_ERROR_LOG_BUFFER, CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES
+    void* values[2] = {job->errors, reinterpret_cast<void*>(sizeof(job->errors))};
+    CUmodule module = nullptr;
+    job->step = "compile PTX";
+    step_log("compiling PTX");
+    job->rc = cu_ModuleLoadDataEx(&module, kScalePtx, 2, options, values);
+    step_log("compile returned");
+    if (job->rc == 0) {
+        job->step = "get function";
+        job->rc = real_cuModuleGetFunction(&g_scale_function, module, "smm_scale_flow");
+    }
+    if (job->rc == 0) {
+        job->step = "allocate";
+        job->rc = cu_MemAlloc(&g_scale_memory, 8);
+    }
+    if (job->rc == 0) {
+        job->step = "upload";
+        job->rc = upload_time();
+    }
+    if (job->rc == 0) job->step = "done";
+    void* popped = nullptr;
+    cu_CtxPopCurrent(&popped);
+    return 0;
+}
+
 // Called on NvPresent's thread (CUDA context current) right before it launches warp_coarse_kernel.
 void inject_time_shift(const uint8_t* warp_params, CUstream stream) {
-    if (g_shift_failed || !cu_ModuleLoadDataEx || !cu_MemAlloc || !cu_MemcpyHtoD) return;
+    if (g_shift_failed || !cu_ModuleLoadDataEx || !cu_MemAlloc || !cu_MemcpyHtoD || !cu_CtxGetCurrent ||
+        !cu_CtxPushCurrent || !cu_CtxPopCurrent)
+        return;
     if (!g_scale_function) {
-        char errors[1024] = "";
-        int options[2] = {5, 6};  // CU_JIT_ERROR_LOG_BUFFER, CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES
-        void* values[2] = {errors, reinterpret_cast<void*>(sizeof(errors))};
-        CUmodule module = nullptr;
-        int rc = cu_ModuleLoadDataEx(&module, kScalePtx, 2, options, values);
-        if (rc == 0) rc = real_cuModuleGetFunction(&g_scale_function, module, "smm_scale_flow");
-        if (rc == 0) rc = cu_MemAlloc(&g_scale_memory, 8);
-        if (rc == 0) rc = upload_time();
+        static SetupJob job;
+        job = {};
+        job.rc = cu_CtxGetCurrent(&job.context);
+        job.step = "get context";
+        if (job.rc == 0 && job.context) {
+            job.rc = -1;
+            job.step = "start thread";
+            const HANDLE thread = CreateThread(nullptr, 16u << 20, setup_thread, &job, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+            if (thread) {
+                WaitForSingleObject(thread, INFINITE);
+                CloseHandle(thread);
+            }
+        }
         EnterCriticalSection(&g_lock);
-        logf("time shift: kernel setup rc=%d %s", rc, errors);
+        logf("time shift: kernel setup rc=%d at step '%s' %s", job.rc, job.step, job.errors);
         LeaveCriticalSection(&g_lock);
-        if (rc != 0) {
+        if (job.rc != 0 || !g_scale_function) {
             g_shift_failed = true;
             g_scale_function = nullptr;
             return;
@@ -671,6 +728,9 @@ DWORD WINAPI bootstrap(void*) {
     cu_ModuleLoadDataEx = reinterpret_cast<decltype(cu_ModuleLoadDataEx)>(reinterpret_cast<void*>(GetProcAddress(cuda, "cuModuleLoadDataEx")));
     cu_MemAlloc = reinterpret_cast<decltype(cu_MemAlloc)>(reinterpret_cast<void*>(GetProcAddress(cuda, "cuMemAlloc_v2")));
     cu_MemcpyHtoD = reinterpret_cast<decltype(cu_MemcpyHtoD)>(reinterpret_cast<void*>(GetProcAddress(cuda, "cuMemcpyHtoD_v2")));
+    cu_CtxGetCurrent = reinterpret_cast<decltype(cu_CtxGetCurrent)>(reinterpret_cast<void*>(GetProcAddress(cuda, "cuCtxGetCurrent")));
+    cu_CtxPushCurrent = reinterpret_cast<decltype(cu_CtxPushCurrent)>(reinterpret_cast<void*>(GetProcAddress(cuda, "cuCtxPushCurrent_v2")));
+    cu_CtxPopCurrent = reinterpret_cast<decltype(cu_CtxPopCurrent)>(reinterpret_cast<void*>(GetProcAddress(cuda, "cuCtxPopCurrent_v2")));
     cu_StreamSynchronize = reinterpret_cast<decltype(cu_StreamSynchronize)>(reinterpret_cast<void*>(GetProcAddress(cuda, "cuStreamSynchronize")));
     logf("capture: F9 dumps two consecutive frames (max %d sets); helpers %s", kMaxDumpSets,
          cu_MemGetAddressRange && cu_MemcpyDtoH && cu_StreamSynchronize ? "ok" : "MISSING");
