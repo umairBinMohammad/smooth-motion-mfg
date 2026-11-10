@@ -10,6 +10,8 @@
 // Output: smm_trace.log beside the game executable (or in %SMM_LOG_DIR%).
 
 #include <windows.h>
+#include <d3d11.h>
+#include <dxgi.h>
 
 #include <stdarg.h>
 #include <stdint.h>
@@ -45,7 +47,7 @@ enum class TestAction { Timeline, CaptureBuffers, CycleTime };
 constexpr TestAction kTestAction = TestAction::Timeline;
 constexpr int kTestKey = VK_F10;
 
-#define SMM_VERSION "prototype 0.4.2"
+#define SMM_VERSION "prototype 0.5"
 
 // ---------------------------------------------------------------- logging
 
@@ -796,8 +798,8 @@ int hook_cuGraphLaunch(CUgraph graph, CUstream stream) {
     const bool tl_key = kTestAction == TestAction::Timeline && (GetAsyncKeyState(kTestKey) & 0x8000) != 0;
     if ((tl_key && !g_timeline_key_down) || (frame == 300 && !g_timeline_auto_done)) {
         g_timeline_auto_done = true;
-        g_timeline = 400;
-        logf("timeline: recording the next 400 events (graph frame %llu)", static_cast<unsigned long long>(frame));
+        g_timeline = 700;
+        logf("timeline: recording the next 700 events (graph frame %llu)", static_cast<unsigned long long>(frame));
         if (tl_key) Beep(900, 60);
     }
     g_timeline_key_down = tl_key;
@@ -885,6 +887,202 @@ void hook(const char* name, T detour, T* original) {
     logf("hook %-44s %s", name, MH_StatusToString(status));
 }
 
+// ------------------------------------------------------------ D3D11/DXGI
+//
+// For DX11 games NvPresent shares D3D11 textures and fences with CUDA, so its
+// output reaches the screen through D3D11 copies and a DXGI Present. These
+// hooks sit on the d3d11.dll / dxgi.dll implementations (addresses taken from
+// a throwaway WARP device at start-up, before NvPresent detours anything) and
+// log calls made by NvPresent. Present is logged for every caller.
+
+bool nvp_fast(void* return_address) {
+    const auto* ra = static_cast<const uint8_t*>(return_address);
+    const uint8_t* base = g_nvp;
+    if (base && ra >= base && ra < base + g_nvp_size) return true;
+    return false;
+}
+
+const wchar_t* caller_name(void* return_address, wchar_t* buffer) {
+    HMODULE m = nullptr;
+    buffer[0] = L'?';
+    buffer[1] = 0;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           static_cast<LPCWSTR>(return_address), &m) && m) {
+        wchar_t path[MAX_PATH];
+        const DWORD n = GetModuleFileNameW(m, path, MAX_PATH);
+        DWORD start = n;
+        while (start && path[start - 1] != L'\\') --start;
+        lstrcpynW(buffer, path + start, 48);
+    }
+    return buffer;
+}
+
+void describe(void* resource, char* out, size_t out_size) {
+    out[0] = 0;
+    if (!resource) return;
+    auto* r = static_cast<ID3D11Resource*>(resource);
+    D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+    r->GetType(&dimension);
+    if (dimension != D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+        snprintf(out, out_size, "dim%d", int(dimension));
+        return;
+    }
+    D3D11_TEXTURE2D_DESC d;
+    static_cast<ID3D11Texture2D*>(r)->GetDesc(&d);
+    snprintf(out, out_size, "%ux%u fmt=%d bind=0x%x misc=0x%x", d.Width, d.Height, int(d.Format), d.BindFlags, d.MiscFlags);
+}
+
+HRESULT (*real_Present)(void*, UINT, UINT);
+HRESULT (*real_Present1)(void*, UINT, UINT, const void*);
+void (*real_CopyResource)(void*, void*, void*);
+void (*real_CopySubresourceRegion)(void*, void*, UINT, UINT, UINT, UINT, void*, UINT, const void*);
+void (*real_Flush)(void*);
+HRESULT (*real_CreateTexture2D)(void*, const D3D11_TEXTURE2D_DESC*, const void*, void**);
+
+uint64_t g_present_count = 0;
+
+void log_present(const char* which, void* swapchain, UINT sync, UINT flags, void* ra, double took, HRESULT hr) {
+    EnterCriticalSection(&g_lock);
+    from_nvpresent(ra);
+    wchar_t name[48];
+    const bool first = g_present_count++ < 30;
+    if (first || g_timeline > 0) {
+        caller_name(ra, name);
+        if (first)
+            logf("%s #%llu sc=%p sync=%u flags=0x%x caller=%ls tid=%lu hr=0x%lx took %.3f ms", which,
+                 static_cast<unsigned long long>(g_present_count), swapchain, sync, flags, name, GetCurrentThreadId(), hr, took);
+        tl("%s sc=%p sync=%u flags=0x%x caller=%ls took %.3f ms", which, swapchain, sync, flags, name, took);
+    }
+    LeaveCriticalSection(&g_lock);
+}
+
+HRESULT hook_Present(void* self, UINT sync, UINT flags) {
+    void* ra = __builtin_return_address(0);
+    const double t0 = now_ms();
+    const HRESULT hr = real_Present(self, sync, flags);
+    log_present("Present", self, sync, flags, ra, now_ms() - t0, hr);
+    return hr;
+}
+
+HRESULT hook_Present1(void* self, UINT sync, UINT flags, const void* params) {
+    void* ra = __builtin_return_address(0);
+    const double t0 = now_ms();
+    const HRESULT hr = real_Present1(self, sync, flags, params);
+    log_present("Present1", self, sync, flags, ra, now_ms() - t0, hr);
+    return hr;
+}
+
+void log_copy(const char* which, void* context, void* dst, void* src) {
+    static uint64_t count = 0;
+    EnterCriticalSection(&g_lock);
+    const bool first = count++ < 40;
+    if (first || g_timeline > 0) {
+        char a[96], b[96];
+        describe(dst, a, sizeof(a));
+        describe(src, b, sizeof(b));
+        if (first) logf("%s ctx=%p dst=%p [%s] src=%p [%s] tid=%lu", which, context, dst, a, src, b, GetCurrentThreadId());
+        tl("%s ctx=%p dst=%p [%s] src=%p [%s]", which, context, dst, a, src, b);
+    }
+    LeaveCriticalSection(&g_lock);
+}
+
+void hook_CopyResource(void* self, void* dst, void* src) {
+    if (nvp_fast(__builtin_return_address(0))) log_copy("CopyResource", self, dst, src);
+    real_CopyResource(self, dst, src);
+}
+
+void hook_CopySubresourceRegion(void* self, void* dst, UINT dst_sub, UINT x, UINT y, UINT z, void* src, UINT src_sub,
+                                const void* box) {
+    if (nvp_fast(__builtin_return_address(0))) log_copy("CopySubresourceRegion", self, dst, src);
+    real_CopySubresourceRegion(self, dst, dst_sub, x, y, z, src, src_sub, box);
+}
+
+void hook_Flush(void* self) {
+    if (nvp_fast(__builtin_return_address(0))) {
+        EnterCriticalSection(&g_lock);
+        tl("Flush ctx=%p", self);
+        LeaveCriticalSection(&g_lock);
+    }
+    real_Flush(self);
+}
+
+HRESULT hook_CreateTexture2D(void* self, const D3D11_TEXTURE2D_DESC* desc, const void* initial, void** texture) {
+    const HRESULT hr = real_CreateTexture2D(self, desc, initial, texture);
+    if (nvp_fast(__builtin_return_address(0)) && desc) {
+        EnterCriticalSection(&g_lock);
+        logf("CreateTexture2D dev=%p %ux%u fmt=%d mips=%u usage=%d bind=0x%x misc=0x%x hr=0x%lx tex=%p", self, desc->Width,
+             desc->Height, int(desc->Format), desc->MipLevels, int(desc->Usage), desc->BindFlags, desc->MiscFlags, hr,
+             texture ? *texture : nullptr);
+        LeaveCriticalSection(&g_lock);
+    }
+    return hr;
+}
+
+bool inside_module(void* address, const wchar_t* module_name) {
+    const HMODULE m = GetModuleHandleW(module_name);
+    if (!m) return false;
+    auto* base = reinterpret_cast<uint8_t*>(m);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+    auto* a = static_cast<uint8_t*>(address);
+    return a >= base && a < base + nt->OptionalHeader.SizeOfImage;
+}
+
+template <class T>
+void hook_address(const char* name, void* target, const wchar_t* module_name, T detour, T* original) {
+    if (!inside_module(target, module_name)) {
+        logf("hook %-44s skipped: %p is not inside %ls (wrapped by another mod?)", name, target, module_name);
+        return;
+    }
+    const MH_STATUS status = MH_CreateHook(target, reinterpret_cast<void*>(detour), reinterpret_cast<void**>(original));
+    logf("hook %-44s %s", name, MH_StatusToString(status));
+}
+
+// Creates a software (WARP) device and swapchain on a hidden window only to read the
+// d3d11/dxgi method addresses, then releases them.
+void install_d3d_hooks() {
+    const HMODULE d3d11 = LoadLibraryW(L"d3d11.dll");
+    using CreateFn = HRESULT(WINAPI*)(IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE, UINT, const D3D_FEATURE_LEVEL*, UINT, UINT,
+                                      const DXGI_SWAP_CHAIN_DESC*, IDXGISwapChain**, ID3D11Device**, D3D_FEATURE_LEVEL*,
+                                      ID3D11DeviceContext**);
+    const auto create = d3d11 ? reinterpret_cast<CreateFn>(reinterpret_cast<void*>(GetProcAddress(d3d11, "D3D11CreateDeviceAndSwapChain"))) : nullptr;
+    if (!create) {
+        logf("d3d hooks: D3D11CreateDeviceAndSwapChain not found");
+        return;
+    }
+    const HWND window = CreateWindowExW(0, L"STATIC", L"smm", WS_POPUP, 0, 0, 16, 16, nullptr, nullptr, nullptr, nullptr);
+    DXGI_SWAP_CHAIN_DESC desc = {};
+    desc.BufferCount = 1;
+    desc.BufferDesc.Width = 16;
+    desc.BufferDesc.Height = 16;
+    desc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    desc.OutputWindow = window;
+    desc.SampleDesc.Count = 1;
+    desc.Windowed = TRUE;
+    IDXGISwapChain* swapchain = nullptr;
+    ID3D11Device* device = nullptr;
+    ID3D11DeviceContext* context = nullptr;
+    const HRESULT hr = create(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &desc, &swapchain,
+                              &device, nullptr, &context);
+    logf("d3d hooks: probe device hr=0x%lx", hr);
+    if (SUCCEEDED(hr) && swapchain && device && context) {
+        void** sc = *reinterpret_cast<void***>(swapchain);
+        void** ctx = *reinterpret_cast<void***>(context);
+        void** dev = *reinterpret_cast<void***>(device);
+        hook_address("IDXGISwapChain::Present", sc[8], L"dxgi.dll", &hook_Present, &real_Present);
+        hook_address("IDXGISwapChain1::Present1", sc[22], L"dxgi.dll", &hook_Present1, &real_Present1);
+        hook_address("ID3D11DeviceContext::CopyResource", ctx[47], L"d3d11.dll", &hook_CopyResource, &real_CopyResource);
+        hook_address("ID3D11DeviceContext::CopySubresourceRegion", ctx[46], L"d3d11.dll", &hook_CopySubresourceRegion,
+                     &real_CopySubresourceRegion);
+        hook_address("ID3D11DeviceContext::Flush", ctx[111], L"d3d11.dll", &hook_Flush, &real_Flush);
+        hook_address("ID3D11Device::CreateTexture2D", dev[5], L"d3d11.dll", &hook_CreateTexture2D, &real_CreateTexture2D);
+    }
+    if (context) context->Release();
+    if (swapchain) swapchain->Release();
+    if (device) device->Release();
+    if (window) DestroyWindow(window);
+}
+
 // Logs the first few fatal exceptions (where, and in which module) without handling them.
 LONG CALLBACK crash_logger(EXCEPTION_POINTERS* info) {
     static LONG count = 0;
@@ -956,6 +1154,7 @@ DWORD WINAPI bootstrap(void*) {
     hook("cuStreamSynchronize", &hook_cuStreamSynchronize, &real_cuStreamSynchronize);
     hook("cuImportExternalMemory", &hook_cuImportExternalMemory, &real_cuImportExternalMemory);
     hook("cuImportExternalSemaphore", &hook_cuImportExternalSemaphore, &real_cuImportExternalSemaphore);
+    install_d3d_hooks();
     if (LoadLibraryW(L"nvapi64.dll")) {
         const MH_STATUS nvapi = MH_CreateHookApi(L"nvapi64.dll", "nvapi_QueryInterface",
                                                  reinterpret_cast<void*>(&hook_nvapi_QueryInterface),
