@@ -81,7 +81,7 @@ uint64_t g_extra_frames = 0, g_extra_skipped = 0;
 bool g_real_pending = false;
 double g_real_target_ms = 0, g_ready_ms = 0;
 
-#define SMM_VERSION "prototype 0.8"
+#define SMM_VERSION "prototype 0.8.1"
 
 // ---------------------------------------------------------------- logging
 
@@ -1151,7 +1151,7 @@ void present_second_generated_frame(void* self, UINT sync, UINT flags, double fi
         real_cuStreamSynchronize(g_mfg_stream);
         ready = now_ms();
         g_ready_ms = ready;
-        wait_until(ready + frame / 3.0 - g_extra_cost_ms);
+        // No waiting here: any wait on the game's present thread lengthens the base frame (0.8 showed this).
         t_start = now_ms();
         uint64_t buffer = g_mfg_buffer;
         uint32_t count = g_mfg_count;
@@ -1170,8 +1170,6 @@ void present_second_generated_frame(void* self, UINT sync, UINT flags, double fi
             t_done = now_ms();
             g_extra_cost_ms = 0.9 * g_extra_cost_ms + 0.1 * (t_cuda - t_start + 0.5);
             if (g_extra_cost_ms > frame / 3.0) g_extra_cost_ms = frame / 3.0;
-            g_real_target_ms = ready + 2.0 * frame / 3.0;
-            g_real_pending = true;
         } else {
             skip = "CUDA launch failed";
         }
