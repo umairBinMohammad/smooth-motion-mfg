@@ -40,7 +40,12 @@ bool readable(const void* address, size_t bytes) {
 
 namespace {
 
-#define SMM_VERSION "prototype 0.4"
+// One test key for every build: F10. kTestAction selects what it does in this build.
+enum class TestAction { Timeline, CaptureBuffers, CycleTime };
+constexpr TestAction kTestAction = TestAction::Timeline;
+constexpr int kTestKey = VK_F10;
+
+#define SMM_VERSION "prototype 0.4.1"
 
 // ---------------------------------------------------------------- logging
 
@@ -474,7 +479,7 @@ void inject_time_shift(const uint8_t* warp_params, CUstream stream) {
 
 // F10 cycles t. Called from the graph-launch hook, between frames.
 void poll_time_key() {
-    const bool key = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+    const bool key = kTestAction == TestAction::CycleTime && (GetAsyncKeyState(kTestKey) & 0x8000) != 0;
     if (key && !g_time_key_down && g_scale_function) {
         g_time_index = (g_time_index + 1) % int(sizeof(kTimes) / sizeof(kTimes[0]));
         const int rc = upload_time();
@@ -781,15 +786,16 @@ int hook_cuGraphLaunch(CUgraph graph, CUstream stream) {
     if (frame < 40) logf("graph launch graph=%p stream=%p tid=%lu rc=%d", graph, stream, GetCurrentThreadId(), rc);
     ++g_window_graph_launches;
 
-    const bool tl_key = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+    const bool tl_key = kTestAction == TestAction::Timeline && (GetAsyncKeyState(kTestKey) & 0x8000) != 0;
     if ((tl_key && !g_timeline_key_down) || (frame == 300 && !g_timeline_auto_done)) {
         g_timeline_auto_done = true;
         g_timeline = 400;
         logf("timeline: recording the next 400 events (graph frame %llu)", static_cast<unsigned long long>(frame));
+        if (tl_key) Beep(900, 60);
     }
     g_timeline_key_down = tl_key;
     tl("graph launch returned after %.3f ms (frame %llu)", now_ms() - t0, static_cast<unsigned long long>(frame));
-    const bool key = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+    const bool key = kTestAction == TestAction::CaptureBuffers && (GetAsyncKeyState(kTestKey) & 0x8000) != 0;
     if (key && !g_key_down && !g_dump_pending && g_dump_sets < kMaxDumpSets) {
         g_dump_pending = 2;
         ++g_dump_sets;
@@ -898,7 +904,7 @@ DWORD WINAPI bootstrap(void*) {
     AddVectoredExceptionHandler(1, crash_logger);
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    logf("smooth-motion-mfg " SMM_VERSION " in %ls (F10 cycles t; F9 captures buffers; F8 records a timeline)", exe);
+    logf("smooth-motion-mfg " SMM_VERSION " in %ls (test key: F10 = record a timeline)", exe);
 
     // NvPresent imports nvcuda.dll by name; loading it first lets us hook its exports
     // before NvPresent makes its first call.

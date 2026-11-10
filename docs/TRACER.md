@@ -46,6 +46,13 @@ Still 2x: one generated frame per real frame, just at a different moment.
 Blend weights are not adjusted yet, so some ghosting at 0.25/0.75 is expected.
 If the kernel fails to compile, the log says so and nothing is inserted.
 
+## Test key
+
+Every build uses **F10** as its single test key. What it does depends on the
+build (`kTestAction` in `tracer.cpp`): record a timeline (0.4.1), capture
+buffers, or cycle t. Older notes in this file that mention F8 or F9 describe
+earlier builds.
+
 ## Use
 
 1. Copy `build\version.dll` next to the game's main executable.
