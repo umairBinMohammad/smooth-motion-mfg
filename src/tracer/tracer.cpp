@@ -40,7 +40,7 @@ bool readable(const void* address, size_t bytes) {
 
 namespace {
 
-#define SMM_VERSION "prototype 0.3.2"
+#define SMM_VERSION "prototype 0.4"
 
 // ---------------------------------------------------------------- logging
 
@@ -458,7 +458,7 @@ void inject_time_shift(const uint8_t* warp_params, CUstream stream) {
     uint64_t buffer = rd<uint64_t>(warp_params + 16);
     const uint32_t width = rd<uint32_t>(warp_params + 32), height = rd<uint32_t>(warp_params + 36);
     uint32_t count = width * height;
-    if (!buffer || width != 256 || height != 144) {
+    if (!buffer || !width || !height || width > 1024 || height > 1024) {
         EnterCriticalSection(&g_lock);
         logf("time shift: unexpected coarse size %ux%u; not injected", width, height);
         LeaveCriticalSection(&g_lock);
@@ -626,6 +626,151 @@ int hook_cuLaunchKernel(CUfunction function, unsigned gx, unsigned gy, unsigned 
     return real_cuLaunchKernel(function, gx, gy, gz, bx, by, bz, shared, stream, params, extra);
 }
 
+// ------------------------------------------------------------- timeline
+//
+// How the generated frame reaches the display. F8 (and, once, the 300th frame
+// of a graph) records the next 400 events with timestamps: graph launches,
+// CUDA/D3D12 hand-over semaphores, copies, and the driver's flip-metering calls.
+
+int g_timeline = 0;
+bool g_timeline_auto_done = false, g_timeline_key_down = false;
+
+void tl(const char* format, ...) {
+    if (g_timeline <= 0) return;
+    char text[400];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(text, sizeof(text), format, args);
+    va_end(args);
+    --g_timeline;
+    logf("TL tid=%lu %s%s", GetCurrentThreadId(), text, g_timeline == 0 ? "  [timeline end]" : "");
+}
+
+int (*real_cuSignalExternalSemaphoresAsync)(void* const*, const void*, unsigned, CUstream);
+int (*real_cuWaitExternalSemaphoresAsync)(void* const*, const void*, unsigned, CUstream);
+int (*real_cuMemcpy2DAsync_v2)(const void*, CUstream);
+int (*real_cuStreamSynchronize)(CUstream);
+int (*real_cuImportExternalMemory)(void**, const void*);
+int (*real_cuImportExternalSemaphore)(void**, const void*);
+void* (*real_nvapi_QueryInterface)(uint32_t);
+int (*real_SetFlipConfig)(void*, void*, void*, void*);
+
+int hook_cuSignalExternalSemaphoresAsync(void* const* semaphores, const void* params, unsigned count, CUstream stream) {
+    if (from_nvpresent_quick(__builtin_return_address(0))) {
+        EnterCriticalSection(&g_lock);
+        tl("cuda signal sem=%p value=%llu n=%u stream=%p", count && readable(semaphores, 8) ? semaphores[0] : nullptr,
+           readable(params, 8) ? static_cast<unsigned long long>(rd<uint64_t>(static_cast<const uint8_t*>(params))) : 0ull,
+           count, stream);
+        LeaveCriticalSection(&g_lock);
+    }
+    return real_cuSignalExternalSemaphoresAsync(semaphores, params, count, stream);
+}
+
+int hook_cuWaitExternalSemaphoresAsync(void* const* semaphores, const void* params, unsigned count, CUstream stream) {
+    if (from_nvpresent_quick(__builtin_return_address(0))) {
+        EnterCriticalSection(&g_lock);
+        tl("cuda wait   sem=%p value=%llu n=%u stream=%p", count && readable(semaphores, 8) ? semaphores[0] : nullptr,
+           readable(params, 8) ? static_cast<unsigned long long>(rd<uint64_t>(static_cast<const uint8_t*>(params))) : 0ull,
+           count, stream);
+        LeaveCriticalSection(&g_lock);
+    }
+    return real_cuWaitExternalSemaphoresAsync(semaphores, params, count, stream);
+}
+
+int hook_cuMemcpy2DAsync_v2(const void* copy, CUstream stream) {
+    if (from_nvpresent_quick(__builtin_return_address(0))) {
+        EnterCriticalSection(&g_lock);
+        char text[300] = "";
+        if (readable(copy, 128)) hex(text, sizeof(text), copy, 128);
+        tl("cuda memcpy2D stream=%p %s", stream, text);
+        LeaveCriticalSection(&g_lock);
+    }
+    return real_cuMemcpy2DAsync_v2(copy, stream);
+}
+
+int hook_cuStreamSynchronize(CUstream stream) {
+    const bool ours = from_nvpresent_quick(__builtin_return_address(0));
+    const double t0 = now_ms();
+    const int rc = real_cuStreamSynchronize(stream);
+    if (ours) {
+        EnterCriticalSection(&g_lock);
+        tl("cuda stream sync stream=%p took %.3f ms", stream, now_ms() - t0);
+        LeaveCriticalSection(&g_lock);
+    }
+    return rc;
+}
+
+int hook_cuImportExternalMemory(void** memory, const void* descriptor) {
+    const int rc = real_cuImportExternalMemory(memory, descriptor);
+    if (from_nvpresent_quick(__builtin_return_address(0))) {
+        EnterCriticalSection(&g_lock);
+        char text[200] = "";
+        if (readable(descriptor, 40)) hex(text, sizeof(text), descriptor, 40);
+        logf("external memory import rc=%d handle=%p desc=%s", rc, memory ? *memory : nullptr, text);
+        LeaveCriticalSection(&g_lock);
+    }
+    return rc;
+}
+
+int hook_cuImportExternalSemaphore(void** semaphore, const void* descriptor) {
+    const int rc = real_cuImportExternalSemaphore(semaphore, descriptor);
+    if (from_nvpresent_quick(__builtin_return_address(0))) {
+        EnterCriticalSection(&g_lock);
+        char text[200] = "";
+        if (readable(descriptor, 24)) hex(text, sizeof(text), descriptor, 24);
+        logf("external semaphore import rc=%d handle=%p desc=%s", rc, semaphore ? *semaphore : nullptr, text);
+        LeaveCriticalSection(&g_lock);
+    }
+    return rc;
+}
+
+// NvAPI_D3D12_SetFlipConfig as NvPresent calls it. Forwarded unchanged; parameters logged
+// before and after (the driver writes feedback into the block).
+int observed_SetFlipConfig(void* a, void* b, void* params, void* d) {
+    static uint64_t calls = 0;
+    static uint8_t last[24];
+    uint8_t before[24] = {};
+    const bool ok = readable(params, 24);
+    if (ok) memcpy(before, params, 24);
+    const double t0 = now_ms();
+    const int rc = real_SetFlipConfig(a, b, params, d);
+    EnterCriticalSection(&g_lock);
+    const bool changed = ok && memcmp(before, last, 24) != 0;
+    if (ok) memcpy(last, before, 24);
+    char in[80] = "", out[80] = "";
+    if (ok) {
+        hex(in, sizeof(in), before, 24);
+        hex(out, sizeof(out), params, 24);
+    }
+    if (calls++ < 20 || changed)
+        logf("SetFlipConfig #%llu a=%p b=%p d=%p rc=%d in=%s out=%s (%.3f ms)", static_cast<unsigned long long>(calls), a, b,
+             d, rc, in, out, now_ms() - t0);
+    tl("SetFlipConfig rc=%d in=%s out=%s", rc, in, out);
+    LeaveCriticalSection(&g_lock);
+    return rc;
+}
+
+void* hook_nvapi_QueryInterface(uint32_t id) {
+    void* result = real_nvapi_QueryInterface(id);
+    if (!from_nvpresent_quick(__builtin_return_address(0))) return result;
+    EnterCriticalSection(&g_lock);
+    static uint32_t seen[96];
+    static int seen_count = 0;
+    bool known = false;
+    for (int i = 0; i < seen_count; ++i) known |= seen[i] == id;
+    if (!known && seen_count < 96) {
+        seen[seen_count++] = id;
+        logf("nvapi interface 0x%08X -> %p%s", id, result,
+             id == 0xF3148C42u ? " (SetFlipConfig)" : id == 0x6194B19Du ? " (flip-config caps)" : "");
+    }
+    LeaveCriticalSection(&g_lock);
+    if (id == 0xF3148C42u && result) {
+        real_SetFlipConfig = reinterpret_cast<decltype(real_SetFlipConfig)>(result);
+        return reinterpret_cast<void*>(&observed_SetFlipConfig);
+    }
+    return result;
+}
+
 int hook_cuGraphLaunch(CUgraph graph, CUstream stream) {
     void* ra = __builtin_return_address(0);
     if (!from_nvpresent_quick(ra)) return real_cuGraphLaunch(graph, stream);
@@ -636,6 +781,14 @@ int hook_cuGraphLaunch(CUgraph graph, CUstream stream) {
     if (frame < 40) logf("graph launch graph=%p stream=%p tid=%lu rc=%d", graph, stream, GetCurrentThreadId(), rc);
     ++g_window_graph_launches;
 
+    const bool tl_key = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+    if ((tl_key && !g_timeline_key_down) || (frame == 300 && !g_timeline_auto_done)) {
+        g_timeline_auto_done = true;
+        g_timeline = 400;
+        logf("timeline: recording the next 400 events (graph frame %llu)", static_cast<unsigned long long>(frame));
+    }
+    g_timeline_key_down = tl_key;
+    tl("graph launch returned after %.3f ms (frame %llu)", now_ms() - t0, static_cast<unsigned long long>(frame));
     const bool key = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
     if (key && !g_key_down && !g_dump_pending && g_dump_sets < kMaxDumpSets) {
         g_dump_pending = 2;
@@ -644,7 +797,7 @@ int hook_cuGraphLaunch(CUgraph graph, CUstream stream) {
     g_key_down = key;
     poll_time_key();
     if (g_dump_pending && cu_StreamSynchronize) {
-        const int sync_rc = cu_StreamSynchronize(stream);
+        const int sync_rc = (real_cuStreamSynchronize ? real_cuStreamSynchronize : cu_StreamSynchronize)(stream);
         const double t1 = now_ms();
         const int part = 2 - g_dump_pending;
         logf("capture set%d_%d graph frame %llu: launch+sync %.3f ms (sync_rc=%d)", g_dump_sets, part,
@@ -745,7 +898,7 @@ DWORD WINAPI bootstrap(void*) {
     AddVectoredExceptionHandler(1, crash_logger);
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    logf("smooth-motion-mfg " SMM_VERSION " in %ls (F10 cycles t = 0.5, 0.25, 0.75, 0; F9 captures)", exe);
+    logf("smooth-motion-mfg " SMM_VERSION " in %ls (F10 cycles t; F9 captures buffers; F8 records a timeline)", exe);
 
     // NvPresent imports nvcuda.dll by name; loading it first lets us hook its exports
     // before NvPresent makes its first call.
@@ -784,6 +937,20 @@ DWORD WINAPI bootstrap(void*) {
     hook("cuArrayCreate_v2", &hook_cuArrayCreate_v2, &real_cuArrayCreate_v2);
     hook("cuExternalMemoryGetMappedMipmappedArray", &hook_cuExternalMemoryGetMappedMipmappedArray,
          &real_cuExternalMemoryGetMappedMipmappedArray);
+    hook("cuSignalExternalSemaphoresAsync", &hook_cuSignalExternalSemaphoresAsync, &real_cuSignalExternalSemaphoresAsync);
+    hook("cuWaitExternalSemaphoresAsync", &hook_cuWaitExternalSemaphoresAsync, &real_cuWaitExternalSemaphoresAsync);
+    hook("cuMemcpy2DAsync_v2", &hook_cuMemcpy2DAsync_v2, &real_cuMemcpy2DAsync_v2);
+    hook("cuStreamSynchronize", &hook_cuStreamSynchronize, &real_cuStreamSynchronize);
+    hook("cuImportExternalMemory", &hook_cuImportExternalMemory, &real_cuImportExternalMemory);
+    hook("cuImportExternalSemaphore", &hook_cuImportExternalSemaphore, &real_cuImportExternalSemaphore);
+    if (LoadLibraryW(L"nvapi64.dll")) {
+        const MH_STATUS nvapi = MH_CreateHookApi(L"nvapi64.dll", "nvapi_QueryInterface",
+                                                 reinterpret_cast<void*>(&hook_nvapi_QueryInterface),
+                                                 reinterpret_cast<void**>(&real_nvapi_QueryInterface));
+        logf("hook nvapi_QueryInterface                     %s", MH_StatusToString(nvapi));
+    } else {
+        logf("nvapi64.dll not loadable (error %lu); flip-metering calls will not be logged", GetLastError());
+    }
     const MH_STATUS status = MH_EnableHook(MH_ALL_HOOKS);
     logf("hooks enabled: %s. NvPresent already loaded: %s", MH_StatusToString(status),
          GetModuleHandleW(L"NvPresent64.dll") ? "yes (earlier module loads were missed)" : "no");
