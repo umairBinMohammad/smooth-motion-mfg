@@ -40,7 +40,7 @@ bool readable(const void* address, size_t bytes) {
 
 namespace {
 
-#define SMM_VERSION "prototype 0.3.1"
+#define SMM_VERSION "prototype 0.3.2"
 
 // ---------------------------------------------------------------- logging
 
@@ -393,53 +393,68 @@ DWORD WINAPI setup_thread(void* argument) {
     job->step = "compile PTX";
     step_log("compiling PTX");
     job->rc = cu_ModuleLoadDataEx(&module, kScalePtx, 2, options, values);
-    step_log("compile returned");
+    step_log(job->rc == 0 ? "compile ok" : "compile FAILED");
     if (job->rc == 0) {
         job->step = "get function";
-        job->rc = real_cuModuleGetFunction(&g_scale_function, module, "smm_scale_flow");
+        CUfunction function = nullptr;
+        job->rc = real_cuModuleGetFunction(&function, module, "smm_scale_flow");
+        step_log("get function returned");
+        if (job->rc == 0) {
+            job->step = "allocate";
+            job->rc = cu_MemAlloc(&g_scale_memory, 8);
+            step_log("allocate returned");
+        }
+        if (job->rc == 0) {
+            job->step = "upload";
+            job->rc = upload_time();
+            step_log("upload returned");
+        }
+        if (job->rc == 0) {
+            job->step = "done";
+            g_scale_function = function;
+        }
     }
-    if (job->rc == 0) {
-        job->step = "allocate";
-        job->rc = cu_MemAlloc(&g_scale_memory, 8);
-    }
-    if (job->rc == 0) {
-        job->step = "upload";
-        job->rc = upload_time();
-    }
-    if (job->rc == 0) job->step = "done";
     void* popped = nullptr;
     cu_CtxPopCurrent(&popped);
+    step_log("context popped");
     return 0;
 }
 
-// Called on NvPresent's thread (CUDA context current) right before it launches warp_coarse_kernel.
-void inject_time_shift(const uint8_t* warp_params, CUstream stream) {
-    if (g_shift_failed || !cu_ModuleLoadDataEx || !cu_MemAlloc || !cu_MemcpyHtoD || !cu_CtxGetCurrent ||
-        !cu_CtxPushCurrent || !cu_CtxPopCurrent)
+// Compiles the scale kernel. Called on NvPresent's thread when it loads its first kernel
+// module: the CUDA context is current and no graph capture is in progress. (NvPresent captures
+// in global mode, where module loads and allocations are not allowed until the capture ends;
+// 0.3 and 0.3.1 did this work mid-capture and the game died.)
+void setup_time_shift() {
+    static bool attempted = false;
+    if (attempted) return;
+    attempted = true;
+    if (!cu_ModuleLoadDataEx || !cu_MemAlloc || !cu_MemcpyHtoD || !cu_CtxGetCurrent || !cu_CtxPushCurrent ||
+        !cu_CtxPopCurrent) {
+        g_shift_failed = true;
         return;
-    if (!g_scale_function) {
-        static SetupJob job;
-        job = {};
-        job.rc = cu_CtxGetCurrent(&job.context);
-        job.step = "get context";
-        if (job.rc == 0 && job.context) {
-            job.rc = -1;
-            job.step = "start thread";
-            const HANDLE thread = CreateThread(nullptr, 16u << 20, setup_thread, &job, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
-            if (thread) {
-                WaitForSingleObject(thread, INFINITE);
-                CloseHandle(thread);
-            }
-        }
-        EnterCriticalSection(&g_lock);
-        logf("time shift: kernel setup rc=%d at step '%s' %s", job.rc, job.step, job.errors);
-        LeaveCriticalSection(&g_lock);
-        if (job.rc != 0 || !g_scale_function) {
-            g_shift_failed = true;
-            g_scale_function = nullptr;
-            return;
+    }
+    static SetupJob job;
+    job = {};
+    job.rc = cu_CtxGetCurrent(&job.context);
+    job.step = "get context";
+    if (job.rc == 0 && job.context) {
+        job.rc = -1;
+        job.step = "start thread";
+        const HANDLE thread = CreateThread(nullptr, 16u << 20, setup_thread, &job, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+        if (thread) {
+            WaitForSingleObject(thread, INFINITE);
+            CloseHandle(thread);
         }
     }
+    EnterCriticalSection(&g_lock);
+    logf("time shift: kernel setup rc=%d at step '%s' capturing=%d %s", job.rc, job.step, g_capturing, job.errors);
+    LeaveCriticalSection(&g_lock);
+    if (job.rc != 0 || !g_scale_function) g_shift_failed = true;
+}
+
+// Called on NvPresent's thread right before it launches warp_coarse_kernel.
+void inject_time_shift(const uint8_t* warp_params, CUstream stream) {
+    if (g_shift_failed || !g_scale_function) return;
     uint64_t buffer = rd<uint64_t>(warp_params + 16);
     const uint32_t width = rd<uint32_t>(warp_params + 32), height = rd<uint32_t>(warp_params + 36);
     uint32_t count = width * height;
@@ -472,10 +487,12 @@ void poll_time_key() {
 int hook_cuModuleLoadData(CUmodule* module, const void* image) {
     const int rc = real_cuModuleLoadData(module, image);
     void* ra = __builtin_return_address(0);
+    bool ours = false;
     EnterCriticalSection(&g_lock);
     if (!from_nvpresent(ra)) {
         note_foreign("cuModuleLoadData", ra);
     } else {
+        ours = !g_capturing;
         const auto* p = static_cast<const uint8_t*>(image);
         const bool inside = p >= g_nvp && p < g_nvp + g_nvp_size;
         uint64_t size = 0;
@@ -490,6 +507,7 @@ int hook_cuModuleLoadData(CUmodule* module, const void* image) {
                  static_cast<unsigned long long>(size), rc, module ? *module : nullptr);
     }
     LeaveCriticalSection(&g_lock);
+    if (ours) setup_time_shift();
     return rc;
 }
 
@@ -701,8 +719,30 @@ void hook(const char* name, T detour, T* original) {
     logf("hook %-44s %s", name, MH_StatusToString(status));
 }
 
+// Logs the first few fatal exceptions (where, and in which module) without handling them.
+LONG CALLBACK crash_logger(EXCEPTION_POINTERS* info) {
+    static LONG count = 0;
+    const DWORD code = info->ExceptionRecord->ExceptionCode;
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_STACK_OVERFLOW && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
+        code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != 0xC0000409u)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (InterlockedIncrement(&count) > 4 || code == EXCEPTION_STACK_OVERFLOW) return EXCEPTION_CONTINUE_SEARCH;
+    void* address = info->ExceptionRecord->ExceptionAddress;
+    HMODULE module = nullptr;
+    wchar_t path[MAX_PATH] = L"?";
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           static_cast<LPCWSTR>(address), &module))
+        GetModuleFileNameW(module, path, MAX_PATH);
+    const ULONG_PTR* p = info->ExceptionRecord->ExceptionInformation;
+    logf("EXCEPTION 0x%08lx at %p (%ls +0x%llx) tid=%lu access=%llu target=0x%llx", code, address, path,
+         static_cast<unsigned long long>(static_cast<uint8_t*>(address) - reinterpret_cast<uint8_t*>(module)),
+         GetCurrentThreadId(), static_cast<unsigned long long>(p[0]), static_cast<unsigned long long>(p[1]));
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 DWORD WINAPI bootstrap(void*) {
     open_log();
+    AddVectoredExceptionHandler(1, crash_logger);
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     logf("smooth-motion-mfg " SMM_VERSION " in %ls (F10 cycles t = 0.5, 0.25, 0.75, 0; F9 captures)", exe);
