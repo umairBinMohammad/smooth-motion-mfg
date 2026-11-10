@@ -47,7 +47,7 @@ enum class TestAction { Timeline, CaptureBuffers, CycleTime };
 constexpr TestAction kTestAction = TestAction::Timeline;
 constexpr int kTestKey = VK_F10;
 
-#define SMM_VERSION "prototype 0.5"
+#define SMM_VERSION "prototype 0.6"
 
 // ---------------------------------------------------------------- logging
 
@@ -1018,6 +1018,139 @@ HRESULT hook_CreateTexture2D(void* self, const D3D11_TEXTURE2D_DESC* desc, const
     return hr;
 }
 
+// More of NvPresent's D3D11 use: how an image gets into the back buffer.
+
+void describe_view(ID3D11View* view, char* out, size_t out_size) {
+    out[0] = 0;
+    if (!view) return;
+    ID3D11Resource* resource = nullptr;
+    view->GetResource(&resource);
+    char text[96];
+    describe(resource, text, sizeof(text));
+    snprintf(out, out_size, "%p [%s]", static_cast<void*>(resource), text);
+    if (resource) resource->Release();
+}
+
+void (*real_Draw)(void*, UINT, UINT);
+void (*real_DrawIndexed)(void*, UINT, UINT, INT);
+void (*real_OMSetRenderTargets)(void*, UINT, ID3D11RenderTargetView* const*, void*);
+void (*real_PSSetShaderResources)(void*, UINT, UINT, ID3D11ShaderResourceView* const*);
+void (*real_CopySubresourceRegion1)(void*, void*, UINT, UINT, UINT, UINT, void*, UINT, const void*, UINT);
+HRESULT (*real_Signal)(void*, void*, UINT64);
+HRESULT (*real_Wait)(void*, void*, UINT64);
+HRESULT (*real_GetBuffer)(void*, UINT, const IID*, void**);
+HRESULT (*real_OpenSharedResource1)(void*, HANDLE, const IID*, void**);
+HRESULT (*real_OpenSharedResource)(void*, HANDLE, const IID*, void**);
+
+void hook_Draw(void* self, UINT count, UINT start) {
+    if (nvp_fast(__builtin_return_address(0))) {
+        EnterCriticalSection(&g_lock);
+        tl("Draw ctx=%p vertices=%u", self, count);
+        LeaveCriticalSection(&g_lock);
+    }
+    real_Draw(self, count, start);
+}
+
+void hook_DrawIndexed(void* self, UINT count, UINT start, INT base) {
+    if (nvp_fast(__builtin_return_address(0))) {
+        EnterCriticalSection(&g_lock);
+        tl("DrawIndexed ctx=%p indices=%u", self, count);
+        LeaveCriticalSection(&g_lock);
+    }
+    real_DrawIndexed(self, count, start, base);
+}
+
+void hook_OMSetRenderTargets(void* self, UINT count, ID3D11RenderTargetView* const* views, void* depth) {
+    if (nvp_fast(__builtin_return_address(0))) {
+        EnterCriticalSection(&g_lock);
+        if (g_timeline > 0) {
+            char text[160] = "";
+            if (count && views) describe_view(views[0], text, sizeof(text));
+            tl("OMSetRenderTargets ctx=%p n=%u target=%s", self, count, text);
+        }
+        LeaveCriticalSection(&g_lock);
+    }
+    real_OMSetRenderTargets(self, count, views, depth);
+}
+
+void hook_PSSetShaderResources(void* self, UINT start, UINT count, ID3D11ShaderResourceView* const* views) {
+    if (nvp_fast(__builtin_return_address(0))) {
+        EnterCriticalSection(&g_lock);
+        if (g_timeline > 0) {
+            for (UINT i = 0; i < count && i < 4 && views; ++i) {
+                char text[160];
+                describe_view(views[i], text, sizeof(text));
+                tl("PSSetShaderResources ctx=%p slot=%u source=%s", self, start + i, text);
+            }
+        }
+        LeaveCriticalSection(&g_lock);
+    }
+    real_PSSetShaderResources(self, start, count, views);
+}
+
+void hook_CopySubresourceRegion1(void* self, void* dst, UINT dst_sub, UINT x, UINT y, UINT z, void* src, UINT src_sub,
+                                 const void* box, UINT flags) {
+    if (nvp_fast(__builtin_return_address(0))) log_copy("CopySubresourceRegion1", self, dst, src);
+    real_CopySubresourceRegion1(self, dst, dst_sub, x, y, z, src, src_sub, box, flags);
+}
+
+HRESULT hook_Signal(void* self, void* fence, UINT64 value) {
+    if (nvp_fast(__builtin_return_address(0))) {
+        EnterCriticalSection(&g_lock);
+        tl("d3d Signal ctx=%p fence=%p value=%llu", self, fence, static_cast<unsigned long long>(value));
+        LeaveCriticalSection(&g_lock);
+    }
+    return real_Signal(self, fence, value);
+}
+
+HRESULT hook_Wait(void* self, void* fence, UINT64 value) {
+    if (nvp_fast(__builtin_return_address(0))) {
+        EnterCriticalSection(&g_lock);
+        tl("d3d Wait   ctx=%p fence=%p value=%llu", self, fence, static_cast<unsigned long long>(value));
+        LeaveCriticalSection(&g_lock);
+    }
+    return real_Wait(self, fence, value);
+}
+
+HRESULT hook_GetBuffer(void* self, UINT index, const IID* iid, void** out) {
+    const HRESULT hr = real_GetBuffer(self, index, iid, out);
+    if (nvp_fast(__builtin_return_address(0))) {
+        static uint64_t count = 0;
+        EnterCriticalSection(&g_lock);
+        char text[96] = "";
+        const bool first = count++ < 12;
+        if ((first || g_timeline > 0) && SUCCEEDED(hr) && out && *out && iid && iid->Data1 == 0x6f15aaf2u)  // ID3D11Texture2D
+            describe(*out, text, sizeof(text));
+        if (first) logf("GetBuffer sc=%p index=%u iid=%08lx -> %p [%s] hr=0x%lx", self, index, iid ? iid->Data1 : 0, out ? *out : nullptr, text, hr);
+        tl("GetBuffer sc=%p index=%u -> %p [%s]", self, index, out ? *out : nullptr, text);
+        LeaveCriticalSection(&g_lock);
+    }
+    return hr;
+}
+
+void log_open(const char* which, void* device, HANDLE handle, const IID* iid, void** out, HRESULT hr, void* ra) {
+    EnterCriticalSection(&g_lock);
+    wchar_t name[48];
+    char text[96] = "";
+    if (SUCCEEDED(hr) && out && *out && iid && iid->Data1 == 0x6f15aaf2u) describe(*out, text, sizeof(text));
+    logf("%s dev=%p handle=0x%llx iid=%08lx -> %p [%s] hr=0x%lx caller=%ls", which, device,
+         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(handle)), iid ? iid->Data1 : 0, out ? *out : nullptr, text,
+         hr, caller_name(ra, name));
+    LeaveCriticalSection(&g_lock);
+}
+
+HRESULT hook_OpenSharedResource1(void* self, HANDLE handle, const IID* iid, void** out) {
+    const HRESULT hr = real_OpenSharedResource1(self, handle, iid, out);
+    log_open("OpenSharedResource1", self, handle, iid, out, hr, __builtin_return_address(0));
+    return hr;
+}
+
+HRESULT hook_OpenSharedResource(void* self, HANDLE handle, const IID* iid, void** out) {
+    const HRESULT hr = real_OpenSharedResource(self, handle, iid, out);
+    log_open("OpenSharedResource", self, handle, iid, out, hr, __builtin_return_address(0));
+    return hr;
+}
+
 bool inside_module(void* address, const wchar_t* module_name) {
     const HMODULE m = GetModuleHandleW(module_name);
     if (!m) return false;
@@ -1076,6 +1209,16 @@ void install_d3d_hooks() {
                      &real_CopySubresourceRegion);
         hook_address("ID3D11DeviceContext::Flush", ctx[111], L"d3d11.dll", &hook_Flush, &real_Flush);
         hook_address("ID3D11Device::CreateTexture2D", dev[5], L"d3d11.dll", &hook_CreateTexture2D, &real_CreateTexture2D);
+        hook_address("ID3D11DeviceContext::Draw", ctx[13], L"d3d11.dll", &hook_Draw, &real_Draw);
+        hook_address("ID3D11DeviceContext::DrawIndexed", ctx[12], L"d3d11.dll", &hook_DrawIndexed, &real_DrawIndexed);
+        hook_address("ID3D11DeviceContext::OMSetRenderTargets", ctx[33], L"d3d11.dll", &hook_OMSetRenderTargets, &real_OMSetRenderTargets);
+        hook_address("ID3D11DeviceContext::PSSetShaderResources", ctx[8], L"d3d11.dll", &hook_PSSetShaderResources, &real_PSSetShaderResources);
+        hook_address("ID3D11DeviceContext1::CopySubresourceRegion1", ctx[115], L"d3d11.dll", &hook_CopySubresourceRegion1, &real_CopySubresourceRegion1);
+        hook_address("ID3D11DeviceContext4::Signal", ctx[147], L"d3d11.dll", &hook_Signal, &real_Signal);
+        hook_address("ID3D11DeviceContext4::Wait", ctx[148], L"d3d11.dll", &hook_Wait, &real_Wait);
+        hook_address("IDXGISwapChain::GetBuffer", sc[9], L"dxgi.dll", &hook_GetBuffer, &real_GetBuffer);
+        hook_address("ID3D11Device::OpenSharedResource", dev[28], L"d3d11.dll", &hook_OpenSharedResource, &real_OpenSharedResource);
+        hook_address("ID3D11Device1::OpenSharedResource1", dev[48], L"d3d11.dll", &hook_OpenSharedResource1, &real_OpenSharedResource1);
     }
     if (context) context->Release();
     if (swapchain) swapchain->Release();
