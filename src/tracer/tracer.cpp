@@ -45,7 +45,7 @@ enum class TestAction { Timeline, CaptureBuffers, CycleTime };
 constexpr TestAction kTestAction = TestAction::Timeline;
 constexpr int kTestKey = VK_F10;
 
-#define SMM_VERSION "prototype 0.4.1"
+#define SMM_VERSION "prototype 0.4.2"
 
 // ---------------------------------------------------------------- logging
 
@@ -137,21 +137,28 @@ constexpr double kSummaryMs = 5000.0;
 uint32_t g_warp_values[32];
 int g_warp_value_count = 0;
 
+// True when the caller is NvPresent64.dll. The module can be unloaded and loaded again at a
+// different address (seen when nvapi64.dll is loaded early), so a miss re-checks by address.
 bool from_nvpresent(void* return_address) {
-    if (!g_nvp) {
-        const HMODULE m = GetModuleHandleW(L"NvPresent64.dll");
-        if (!m) return false;
-        auto* base = reinterpret_cast<uint8_t*>(m);
-        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
-            base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
-        g_nvp_size = nt->OptionalHeader.SizeOfImage;
-        g_nvp = base;
-        wchar_t path[MAX_PATH];
-        GetModuleFileNameW(m, path, MAX_PATH);
-        logf("NvPresent64.dll at %p size 0x%zx path %ls", base, g_nvp_size, path);
-    }
     const auto* ra = static_cast<const uint8_t*>(return_address);
-    return ra >= g_nvp && ra < g_nvp + g_nvp_size;
+    if (g_nvp && ra >= g_nvp && ra < g_nvp + g_nvp_size) return true;
+    HMODULE m = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            static_cast<LPCWSTR>(return_address), &m) || !m)
+        return false;
+    auto* base = reinterpret_cast<uint8_t*>(m);
+    if (base == g_nvp) return false;
+    wchar_t path[MAX_PATH];
+    const DWORD n = GetModuleFileNameW(m, path, MAX_PATH);
+    static const wchar_t kName[] = L"NvPresent64.dll";
+    const DWORD name_len = sizeof(kName) / sizeof(wchar_t) - 1;
+    if (n < name_len || lstrcmpiW(path + n - name_len, kName) != 0) return false;
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
+        base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+    g_nvp_size = nt->OptionalHeader.SizeOfImage;
+    g_nvp = base;
+    logf("NvPresent64.dll at %p size 0x%zx path %ls", base, g_nvp_size, path);
+    return true;
 }
 
 void note_foreign(const char* api, void* return_address) {
