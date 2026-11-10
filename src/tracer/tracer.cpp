@@ -43,11 +43,43 @@ bool readable(const void* address, size_t bytes) {
 namespace {
 
 // One test key for every build: F10. kTestAction selects what it does in this build.
-enum class TestAction { Timeline, CaptureBuffers, CycleTime };
-constexpr TestAction kTestAction = TestAction::Timeline;
+enum class TestAction { Timeline, CaptureBuffers, CycleTime, Mfg };
+constexpr TestAction kTestAction = TestAction::Mfg;
 constexpr int kTestKey = VK_F10;
 
-#define SMM_VERSION "prototype 0.6"
+// ---- multi-frame (3x) state, filled in by the CUDA and D3D11 hooks below ----
+struct Link {
+    void* key;
+    void* value;
+};
+struct LinkTable {
+    Link items[64];
+    unsigned next = 0;
+    void add(void* key, void* value) { items[next++ % 64] = {key, value}; }
+    void* find(void* key) const {  // most recent entry wins
+        for (unsigned i = 0; i < 64; ++i) {
+            const Link& l = items[(next - 1 - i) % 64];
+            if (l.key == key && key) return l.value;
+        }
+        return nullptr;
+    }
+};
+LinkTable g_extmem_to_handle, g_mip_to_extmem, g_array_to_mip, g_surf_to_array, g_handle_to_texture, g_texture_to_device;
+
+bool g_mfg_on = false, g_mfg_ready = false, g_mfg_pending = false, g_mfg_key_down = false;
+DWORD g_mfg_tid = 0;
+void* g_warp_function = nullptr;
+unsigned g_warp_dims[7] = {};
+uint8_t g_warp_block[136] = {};
+void* g_mfg_stream = nullptr;
+uint64_t g_mfg_buffer = 0, g_scale_memory2 = 0;
+uint32_t g_mfg_count = 0;
+void* g_out_texture = nullptr;  // ID3D11Texture2D on NvPresent's device that CUDA writes the generated frame into
+void* g_out_device = nullptr;
+double g_frame_ms = 0, g_last_launch_ms = 0, g_extra_cost_ms = 3.0;
+uint64_t g_extra_frames = 0, g_extra_skipped = 0;
+
+#define SMM_VERSION "prototype 0.7"
 
 // ---------------------------------------------------------------- logging
 
@@ -370,11 +402,12 @@ bool g_shift_failed = false, g_time_key_down = false;
 CUfunction g_scale_function = nullptr;
 uint64_t g_scale_memory = 0;
 
-int upload_time() {
-    const float t = kTimes[g_time_index];
+int upload_scales(float t) {
     const float scales[2] = {2.0f * t, 2.0f * (1.0f - t)};
     return cu_MemcpyHtoD(g_scale_memory, scales, sizeof(scales));
 }
+
+int upload_time() { return upload_scales(kTimes[g_time_index]); }
 
 int (*cu_CtxGetCurrent)(void**);
 int (*cu_CtxPushCurrent)(void*);
@@ -422,6 +455,13 @@ DWORD WINAPI setup_thread(void* argument) {
             job->step = "upload";
             job->rc = upload_time();
             step_log("upload returned");
+        }
+        if (job->rc == 0) {
+            // Second pass of 3x: the buffer already holds t = 1/3 flows; x2 and x0.5 turn them into t = 2/3.
+            job->step = "allocate 2";
+            job->rc = cu_MemAlloc(&g_scale_memory2, 8);
+            const float second[2] = {2.0f, 0.5f};
+            if (job->rc == 0) job->rc = cu_MemcpyHtoD(g_scale_memory2, second, sizeof(second));
         }
         if (job->rc == 0) {
             job->step = "done";
@@ -480,6 +520,9 @@ void inject_time_shift(const uint8_t* warp_params, CUstream stream) {
     }
     void* params[3] = {&buffer, &g_scale_memory, &count};
     const int rc = real_cuLaunchKernel(g_scale_function, (count + 255) / 256, 1, 1, 256, 1, 1, 0, stream, params, nullptr);
+    g_mfg_buffer = buffer;
+    g_mfg_count = count;
+    g_mfg_stream = stream;
     EnterCriticalSection(&g_lock);
     logf("time shift: scale kernel inserted before warp (buffer=0x%llx pixels=%u t=%.2f) rc=%d%s",
          static_cast<unsigned long long>(buffer), count, kTimes[g_time_index], rc, g_capturing ? " [recorded into graph]" : "");
@@ -636,7 +679,13 @@ int hook_cuLaunchKernel(CUfunction function, unsigned gx, unsigned gy, unsigned 
         summary_if_due();
     }
     LeaveCriticalSection(&g_lock);
-    if (is_warp) inject_time_shift(warp_block, stream);
+    if (is_warp) {
+        inject_time_shift(warp_block, stream);
+        g_warp_function = function;
+        const unsigned dims[7] = {gx, gy, gz, bx, by, bz, shared};
+        memcpy(g_warp_dims, dims, sizeof(dims));
+        memcpy(g_warp_block, warp_block, sizeof(g_warp_block));
+    }
     return real_cuLaunchKernel(function, gx, gy, gz, bx, by, bz, shared, stream, params, extra);
 }
 
@@ -714,8 +763,38 @@ int hook_cuStreamSynchronize(CUstream stream) {
     return rc;
 }
 
+int (*real_cuMipmappedArrayGetLevel)(void**, void*, unsigned);
+int (*real_cuSurfObjectCreate)(uint64_t*, const void*);
+
+int hook_cuMipmappedArrayGetLevel(void** array, void* mipmap, unsigned level) {
+    const int rc = real_cuMipmappedArrayGetLevel(array, mipmap, level);
+    if (rc == 0 && array && from_nvpresent_quick(__builtin_return_address(0))) {
+        EnterCriticalSection(&g_lock);
+        g_array_to_mip.add(*array, mipmap);
+        LeaveCriticalSection(&g_lock);
+    }
+    return rc;
+}
+
+int hook_cuSurfObjectCreate(uint64_t* surface, const void* descriptor) {
+    const int rc = real_cuSurfObjectCreate(surface, descriptor);
+    if (rc == 0 && surface && from_nvpresent_quick(__builtin_return_address(0)) && readable(descriptor, 16)) {
+        EnterCriticalSection(&g_lock);
+        void* array = reinterpret_cast<void*>(rd<uint64_t>(static_cast<const uint8_t*>(descriptor) + 8));
+        g_surf_to_array.add(reinterpret_cast<void*>(*surface), array);
+        logf("surface object 0x%llx on array %p", static_cast<unsigned long long>(*surface), array);
+        LeaveCriticalSection(&g_lock);
+    }
+    return rc;
+}
+
 int hook_cuImportExternalMemory(void** memory, const void* descriptor) {
     const int rc = real_cuImportExternalMemory(memory, descriptor);
+    if (rc == 0 && memory && readable(descriptor, 16) && from_nvpresent_quick(__builtin_return_address(0))) {
+        EnterCriticalSection(&g_lock);
+        g_extmem_to_handle.add(*memory, reinterpret_cast<void*>(rd<uint64_t>(static_cast<const uint8_t*>(descriptor) + 8)));
+        LeaveCriticalSection(&g_lock);
+    }
     if (from_nvpresent_quick(__builtin_return_address(0))) {
         EnterCriticalSection(&g_lock);
         char text[200] = "";
@@ -795,6 +874,29 @@ int hook_cuGraphLaunch(CUgraph graph, CUstream stream) {
     if (frame < 40) logf("graph launch graph=%p stream=%p tid=%lu rc=%d", graph, stream, GetCurrentThreadId(), rc);
     ++g_window_graph_launches;
 
+    if (g_last_launch_ms > 0 && t0 - g_last_launch_ms < 250.0) {
+        const double dt = t0 - g_last_launch_ms;
+        g_frame_ms = g_frame_ms > 0 ? 0.9 * g_frame_ms + 0.1 * dt : dt;
+    }
+    g_last_launch_ms = t0;
+    if (kTestAction == TestAction::Mfg) {
+        const bool mfg_key = (GetAsyncKeyState(kTestKey) & 0x8000) != 0;
+        if (mfg_key && !g_mfg_key_down) {
+            if (g_mfg_ready) {
+                g_mfg_on = !g_mfg_on;
+                const int upload_rc = upload_scales(g_mfg_on ? 1.0f / 3.0f : 0.5f);
+                logf("3x: F10 -> %s (upload rc=%d, base frame %.2f ms)", g_mfg_on ? "ON" : "off", upload_rc, g_frame_ms);
+                g_timeline = 400;
+                Beep(g_mfg_on ? 1200 : 500, 80);
+            } else {
+                logf("3x: F10 pressed but not ready");
+                Beep(250, 250);
+            }
+        }
+        g_mfg_key_down = mfg_key;
+        g_mfg_pending = g_mfg_on && g_mfg_ready && rc == 0;
+        g_mfg_tid = GetCurrentThreadId();
+    }
     const bool tl_key = kTestAction == TestAction::Timeline && (GetAsyncKeyState(kTestKey) & 0x8000) != 0;
     if ((tl_key && !g_timeline_key_down) || (frame == 300 && !g_timeline_auto_done)) {
         g_timeline_auto_done = true;
@@ -826,11 +928,38 @@ int hook_cuGraphLaunch(CUgraph graph, CUstream stream) {
     return rc;
 }
 
+// Finds the D3D11 texture behind the surface object that warp_coarse_kernel writes to:
+// surface object (in the warp parameters) -> CUDA array -> mipmapped array -> external
+// memory -> shared handle -> texture opened on NvPresent's device.
+void resolve_output_texture() {
+    void* texture = nullptr;
+    for (size_t offset = 0; offset + 8 <= sizeof(g_warp_block) && !texture; offset += 8) {
+        void* candidate = reinterpret_cast<void*>(rd<uint64_t>(g_warp_block + offset));
+        void* array = g_surf_to_array.find(candidate);
+        if (!array) continue;
+        void* mip = g_array_to_mip.find(array);
+        void* memory = g_mip_to_extmem.find(mip);
+        void* handle = g_extmem_to_handle.find(memory);
+        texture = g_handle_to_texture.find(handle);
+        logf("3x: warp param +%zu surface=%p array=%p mip=%p extmem=%p handle=%p texture=%p", offset, candidate, array, mip,
+             memory, handle, texture);
+    }
+    if (texture != g_out_texture) {
+        if (texture) static_cast<IUnknown*>(texture)->AddRef();
+        if (g_out_texture) static_cast<IUnknown*>(g_out_texture)->Release();
+        g_out_texture = texture;
+        g_out_device = g_texture_to_device.find(texture);
+    }
+}
+
 int hook_cuStreamBeginCapture_v2(CUstream stream, int mode) {
     void* ra = __builtin_return_address(0);
     EnterCriticalSection(&g_lock);
     if (from_nvpresent(ra)) {
         ++g_capturing;
+        g_mfg_ready = false;
+        g_warp_function = nullptr;
+        g_mfg_buffer = 0;
         logf("capture begin stream=%p mode=%d (launches until 'capture end' are recorded into a graph)", stream, mode);
     }
     LeaveCriticalSection(&g_lock);
@@ -845,6 +974,10 @@ int hook_cuStreamEndCapture(CUstream stream, CUgraph* graph) {
         if (g_capturing) --g_capturing;
         g_graph_frames = 0;
         logf("capture end stream=%p graph=%p rc=%d", stream, graph ? *graph : nullptr, rc);
+        resolve_output_texture();
+        g_mfg_ready = g_warp_function && g_mfg_buffer && g_scale_function && g_scale_memory2 && g_out_texture;
+        logf("3x: %s (warp=%p buffer=0x%llx output texture=%p)", g_mfg_ready ? "ready" : "NOT ready", g_warp_function,
+             static_cast<unsigned long long>(g_mfg_buffer), g_out_texture);
     }
     LeaveCriticalSection(&g_lock);
     return rc;
@@ -868,6 +1001,7 @@ int hook_cuExternalMemoryGetMappedMipmappedArray(void** mipmap, void* memory, co
     const int rc = real_cuExternalMemoryGetMappedMipmappedArray(mipmap, memory, descriptor);
     void* ra = __builtin_return_address(0);
     EnterCriticalSection(&g_lock);
+    if (rc == 0 && mipmap && from_nvpresent(ra)) g_mip_to_extmem.add(*mipmap, memory);
     if (from_nvpresent(ra) && readable(descriptor, 48)) {
         // { u64 offset; { size_t W, H, D; u32 format, channels, flags; } ; u32 levels; }
         const auto* d = static_cast<const uint8_t*>(descriptor);
@@ -956,11 +1090,102 @@ void log_present(const char* which, void* swapchain, UINT sync, UINT flags, void
     LeaveCriticalSection(&g_lock);
 }
 
+HRESULT (*real_GetBuffer)(void*, UINT, const IID*, void**);
+
+void wait_until(double target_ms) {
+    static HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /* high resolution */, TIMER_ALL_ACCESS);
+    for (;;) {
+        const double left = target_ms - now_ms();
+        if (left <= 0) return;
+        if (left > 1.5 && timer) {
+            LARGE_INTEGER due;
+            due.QuadPart = -static_cast<LONGLONG>((left - 1.0) * 10000.0);
+            SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
+            WaitForSingleObject(timer, 50);
+        } else {
+            YieldProcessor();
+        }
+    }
+}
+
+// 3x: called right after NvPresent presented its generated frame (built for t = 1/3).
+// Builds the t = 2/3 frame with NVIDIA's own warp kernel into the same texture, copies it
+// into the back buffer and presents it. NvPresent then presents the real frame as usual.
+void present_second_generated_frame(void* self, UINT sync, UINT flags, double first_present_ms) {
+    const char* skip = nullptr;
+    auto* swapchain = static_cast<IDXGISwapChain*>(self);
+    ID3D11Device* device = nullptr;
+    ID3D11DeviceContext* context = nullptr;
+    ID3D11Texture2D* back = nullptr;
+    int scale_rc = -1, warp_rc = -1, sync_rc = -1;
+    HRESULT hr = E_FAIL;
+    double t_start = 0, t_cuda = 0, t_done = 0;
+    const IID iid_device = __uuidof(ID3D11Device), iid_texture = __uuidof(ID3D11Texture2D);
+    if (FAILED(swapchain->GetDevice(iid_device, reinterpret_cast<void**>(&device))) || !device) skip = "no device";
+    else if (device != g_out_device) skip = "swapchain is on a different device";
+    else if (FAILED(real_GetBuffer(self, 0, &iid_texture, reinterpret_cast<void**>(&back))) || !back) skip = "no back buffer";
+    else {
+        D3D11_TEXTURE2D_DESC a, b;
+        back->GetDesc(&a);
+        static_cast<ID3D11Texture2D*>(g_out_texture)->GetDesc(&b);
+        if (a.Width != b.Width || a.Height != b.Height || a.Format != b.Format || a.SampleDesc.Count != b.SampleDesc.Count)
+            skip = "back buffer and generated texture differ";
+    }
+    if (!skip) {
+        const double frame = g_frame_ms > 4.0 ? g_frame_ms : 33.0;
+        wait_until(first_present_ms + frame / 3.0 - g_extra_cost_ms);
+        t_start = now_ms();
+        uint64_t buffer = g_mfg_buffer;
+        uint32_t count = g_mfg_count;
+        void* scale_params[3] = {&buffer, &g_scale_memory2, &count};
+        scale_rc = real_cuLaunchKernel(g_scale_function, (count + 255) / 256, 1, 1, 256, 1, 1, 0, g_mfg_stream, scale_params, nullptr);
+        void* warp_params[1] = {g_warp_block};
+        if (scale_rc == 0)
+            warp_rc = real_cuLaunchKernel(g_warp_function, g_warp_dims[0], g_warp_dims[1], g_warp_dims[2], g_warp_dims[3],
+                                          g_warp_dims[4], g_warp_dims[5], g_warp_dims[6], g_mfg_stream, warp_params, nullptr);
+        sync_rc = real_cuStreamSynchronize(g_mfg_stream);
+        t_cuda = now_ms();
+        if (scale_rc == 0 && warp_rc == 0 && sync_rc == 0) {
+            device->GetImmediateContext(&context);
+            context->CopyResource(back, static_cast<ID3D11Texture2D*>(g_out_texture));
+            hr = real_Present(self, sync, flags);
+            t_done = now_ms();
+            g_extra_cost_ms = 0.9 * g_extra_cost_ms + 0.1 * (t_cuda - t_start + 0.5);
+        } else {
+            skip = "CUDA launch failed";
+        }
+    }
+    if (context) context->Release();
+    if (back) back->Release();
+    if (device) device->Release();
+    EnterCriticalSection(&g_lock);
+    if (skip) {
+        if (g_extra_skipped++ < 10) logf("3x: extra frame skipped: %s (scale rc=%d warp rc=%d sync rc=%d)", skip, scale_rc, warp_rc, sync_rc);
+        if (g_extra_skipped == 10) {
+            g_mfg_on = false;
+            upload_scales(0.5f);
+            logf("3x: switched off after repeated skips");
+        }
+    } else {
+        const uint64_t n = g_extra_frames++;
+        if (n < 20 || n % 600 == 0)
+            logf("3x: extra frame %llu: waited %.2f ms after first present, cuda %.2f ms, copy+present %.2f ms, hr=0x%lx, base frame %.2f ms",
+                 static_cast<unsigned long long>(n), t_start - first_present_ms, t_cuda - t_start, t_done - t_cuda, hr, g_frame_ms);
+        tl("3x extra frame presented: +%.2f ms after first, cuda %.2f ms, copy+present %.2f ms", t_done - first_present_ms,
+           t_cuda - t_start, t_done - t_cuda);
+    }
+    LeaveCriticalSection(&g_lock);
+}
+
 HRESULT hook_Present(void* self, UINT sync, UINT flags) {
     void* ra = __builtin_return_address(0);
+    const bool first_generated = g_mfg_pending && g_mfg_tid == GetCurrentThreadId();
+    if (first_generated) g_mfg_pending = false;
     const double t0 = now_ms();
     const HRESULT hr = real_Present(self, sync, flags);
-    log_present("Present", self, sync, flags, ra, now_ms() - t0, hr);
+    const double t1 = now_ms();
+    log_present("Present", self, sync, flags, ra, t1 - t0, hr);
+    if (first_generated && SUCCEEDED(hr)) present_second_generated_frame(self, sync, flags, t1);
     return hr;
 }
 
@@ -1038,7 +1263,6 @@ void (*real_PSSetShaderResources)(void*, UINT, UINT, ID3D11ShaderResourceView* c
 void (*real_CopySubresourceRegion1)(void*, void*, UINT, UINT, UINT, UINT, void*, UINT, const void*, UINT);
 HRESULT (*real_Signal)(void*, void*, UINT64);
 HRESULT (*real_Wait)(void*, void*, UINT64);
-HRESULT (*real_GetBuffer)(void*, UINT, const IID*, void**);
 HRESULT (*real_OpenSharedResource1)(void*, HANDLE, const IID*, void**);
 HRESULT (*real_OpenSharedResource)(void*, HANDLE, const IID*, void**);
 
@@ -1141,6 +1365,12 @@ void log_open(const char* which, void* device, HANDLE handle, const IID* iid, vo
 
 HRESULT hook_OpenSharedResource1(void* self, HANDLE handle, const IID* iid, void** out) {
     const HRESULT hr = real_OpenSharedResource1(self, handle, iid, out);
+    if (SUCCEEDED(hr) && out && *out && iid && iid->Data1 == 0x6f15aaf2u && nvp_fast(__builtin_return_address(0))) {
+        EnterCriticalSection(&g_lock);
+        g_handle_to_texture.add(handle, *out);
+        g_texture_to_device.add(*out, self);
+        LeaveCriticalSection(&g_lock);
+    }
     log_open("OpenSharedResource1", self, handle, iid, out, hr, __builtin_return_address(0));
     return hr;
 }
@@ -1252,7 +1482,7 @@ DWORD WINAPI bootstrap(void*) {
     AddVectoredExceptionHandler(1, crash_logger);
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    logf("smooth-motion-mfg " SMM_VERSION " in %ls (test key: F10 = record a timeline)", exe);
+    logf("smooth-motion-mfg " SMM_VERSION " in %ls (test key: F10 = 3x on/off)", exe);
 
     // NvPresent imports nvcuda.dll by name; loading it first lets us hook its exports
     // before NvPresent makes its first call.
@@ -1297,6 +1527,8 @@ DWORD WINAPI bootstrap(void*) {
     hook("cuStreamSynchronize", &hook_cuStreamSynchronize, &real_cuStreamSynchronize);
     hook("cuImportExternalMemory", &hook_cuImportExternalMemory, &real_cuImportExternalMemory);
     hook("cuImportExternalSemaphore", &hook_cuImportExternalSemaphore, &real_cuImportExternalSemaphore);
+    hook("cuMipmappedArrayGetLevel", &hook_cuMipmappedArrayGetLevel, &real_cuMipmappedArrayGetLevel);
+    hook("cuSurfObjectCreate", &hook_cuSurfObjectCreate, &real_cuSurfObjectCreate);
     install_d3d_hooks();
     if (LoadLibraryW(L"nvapi64.dll")) {
         const MH_STATUS nvapi = MH_CreateHookApi(L"nvapi64.dll", "nvapi_QueryInterface",

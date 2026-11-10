@@ -34,7 +34,7 @@ First target: Ghost Recon Breakpoint (DX11), RTX 40-series, 3x.
 - [x] Phase 0: static inspection of driver 616.56 ([findings](docs/findings/616.56.md))
 - [ ] Phase 1: runtime tracer (log-only). Built, see [docs/TRACER.md](docs/TRACER.md); first trace done ([findings](docs/findings/616.56-trace.md)); network output decoded ([findings](docs/findings/616.56-network-output.md)): flows can be rescaled to other times
 - [ ] Phase 2: frames at time t. Prototype 0.3.2 shifts NVIDIA's generated frame in time at 2x (confirmed in game at t = 0; 0.25/0.75 not yet verified by capture)
-- [ ] Phase 3: presenting the extra frames. Prototype 0.4 traces the hand-over to the display (F8 timeline, flip-metering calls)
+- [ ] Phase 3: presenting the extra frames. Presentation path traced (0.4 to 0.6); prototype 0.7 is the first 3x attempt (F10), in-game check pending
 
 ## Rules for this project
 

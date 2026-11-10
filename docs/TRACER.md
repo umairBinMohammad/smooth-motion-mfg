@@ -46,11 +46,27 @@ Still 2x: one generated frame per real frame, just at a different moment.
 Blend weights are not adjusted yet, so some ghosting at 0.25/0.75 is expected.
 If the kernel fails to compile, the log says so and nothing is inserted.
 
+## 3x attempt (prototype 0.7)
+
+F10 toggles 3x (high beep on, low beep off; a long low beep means it could not
+get ready, see the log). When on, per real frame:
+
+1. NvPresent's graph builds its generated frame at t = 1/3 (our scale kernel).
+2. NvPresent presents it.
+3. We wait about a third of a frame, rescale the flows to t = 2/3, launch
+   NVIDIA's `warp_coarse_kernel` again with its recorded parameters, wait for
+   CUDA, copy the generated texture into the back buffer and Present.
+4. NvPresent presents the real frame as usual.
+
+Known gaps: blend weights are not adjusted for t; the real frame's timing is
+still NvPresent's, so spacing is not even yet; no fence between CUDA and
+D3D11 for the second pass (CPU waits instead).
+
 ## Test key
 
 Every build uses **F10** as its single test key. What it does depends on the
-build (`kTestAction` in `tracer.cpp`): record a timeline (0.4.1), capture
-buffers, or cycle t. Older notes in this file that mention F8 or F9 describe
+build (`kTestAction` in `tracer.cpp`): record a timeline (0.4.1 to 0.6), capture
+buffers, cycle t, or toggle 3x (0.7). Older notes in this file that mention F8 or F9 describe
 earlier builds.
 
 ## Use
