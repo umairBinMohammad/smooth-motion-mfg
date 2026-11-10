@@ -78,8 +78,10 @@ void* g_out_texture = nullptr;  // ID3D11Texture2D on NvPresent's device that CU
 void* g_out_device = nullptr;
 double g_frame_ms = 0, g_last_launch_ms = 0, g_extra_cost_ms = 3.0;
 uint64_t g_extra_frames = 0, g_extra_skipped = 0;
+bool g_real_pending = false;
+double g_real_target_ms = 0, g_ready_ms = 0;
 
-#define SMM_VERSION "prototype 0.7"
+#define SMM_VERSION "prototype 0.8"
 
 // ---------------------------------------------------------------- logging
 
@@ -886,7 +888,7 @@ int hook_cuGraphLaunch(CUgraph graph, CUstream stream) {
                 g_mfg_on = !g_mfg_on;
                 const int upload_rc = upload_scales(g_mfg_on ? 1.0f / 3.0f : 0.5f);
                 logf("3x: F10 -> %s (upload rc=%d, base frame %.2f ms)", g_mfg_on ? "ON" : "off", upload_rc, g_frame_ms);
-                g_timeline = 400;
+                g_timeline = 900;
                 Beep(g_mfg_on ? 1200 : 500, 80);
             } else {
                 logf("3x: F10 pressed but not ready");
@@ -1080,6 +1082,17 @@ void log_present(const char* which, void* swapchain, UINT sync, UINT flags, void
     from_nvpresent(ra);
     wchar_t name[48];
     const bool first = g_present_count++ < 30;
+    if (g_timeline > 0) {
+        // Which present is on screen, and since when (ms on this log's clock).
+        DXGI_FRAME_STATISTICS stats = {};
+        UINT last = 0;
+        auto* sc = static_cast<IDXGISwapChain*>(swapchain);
+        const HRESULT stats_hr = sc->GetFrameStatistics(&stats);
+        sc->GetLastPresentCount(&last);
+        tl("stats hr=0x%lx submitted=%u displayed=%u refresh=%u sync_refresh=%u at=%.3f", stats_hr, last, stats.PresentCount,
+           stats.PresentRefreshCount, stats.SyncRefreshCount,
+           1000.0 * double(stats.SyncQPCTime.QuadPart - g_qpc0.QuadPart) / double(g_qpf.QuadPart));
+    }
     if (first || g_timeline > 0) {
         caller_name(ra, name);
         if (first)
@@ -1131,9 +1144,14 @@ void present_second_generated_frame(void* self, UINT sync, UINT flags, double fi
         if (a.Width != b.Width || a.Height != b.Height || a.Format != b.Format || a.SampleDesc.Count != b.SampleDesc.Count)
             skip = "back buffer and generated texture differ";
     }
+    double ready = 0;
+    const double frame = g_frame_ms > 4.0 ? g_frame_ms : 33.0;
     if (!skip) {
-        const double frame = g_frame_ms > 4.0 ? g_frame_ms : 33.0;
-        wait_until(first_present_ms + frame / 3.0 - g_extra_cost_ms);
+        // The first generated frame can only be shown once the graph has finished on the GPU.
+        real_cuStreamSynchronize(g_mfg_stream);
+        ready = now_ms();
+        g_ready_ms = ready;
+        wait_until(ready + frame / 3.0 - g_extra_cost_ms);
         t_start = now_ms();
         uint64_t buffer = g_mfg_buffer;
         uint32_t count = g_mfg_count;
@@ -1151,6 +1169,9 @@ void present_second_generated_frame(void* self, UINT sync, UINT flags, double fi
             hr = real_Present(self, sync, flags);
             t_done = now_ms();
             g_extra_cost_ms = 0.9 * g_extra_cost_ms + 0.1 * (t_cuda - t_start + 0.5);
+            if (g_extra_cost_ms > frame / 3.0) g_extra_cost_ms = frame / 3.0;
+            g_real_target_ms = ready + 2.0 * frame / 3.0;
+            g_real_pending = true;
         } else {
             skip = "CUDA launch failed";
         }
@@ -1169,18 +1190,27 @@ void present_second_generated_frame(void* self, UINT sync, UINT flags, double fi
     } else {
         const uint64_t n = g_extra_frames++;
         if (n < 20 || n % 600 == 0)
-            logf("3x: extra frame %llu: waited %.2f ms after first present, cuda %.2f ms, copy+present %.2f ms, hr=0x%lx, base frame %.2f ms",
-                 static_cast<unsigned long long>(n), t_start - first_present_ms, t_cuda - t_start, t_done - t_cuda, hr, g_frame_ms);
-        tl("3x extra frame presented: +%.2f ms after first, cuda %.2f ms, copy+present %.2f ms", t_done - first_present_ms,
-           t_cuda - t_start, t_done - t_cuda);
+            logf("3x: extra frame %llu: graph ready %.2f ms after launch; second frame at ready+%.2f (cuda %.2f, copy+present %.2f) hr=0x%lx; base frame %.2f ms",
+                 static_cast<unsigned long long>(n), ready - g_last_launch_ms, t_done - ready, t_cuda - t_start, t_done - t_cuda, hr, g_frame_ms);
+        tl("3x second generated frame presented: ready=launch+%.2f, presented at ready+%.2f (cuda %.2f ms)", ready - g_last_launch_ms,
+           t_done - ready, t_cuda - t_start);
     }
     LeaveCriticalSection(&g_lock);
 }
 
 HRESULT hook_Present(void* self, UINT sync, UINT flags) {
     void* ra = __builtin_return_address(0);
-    const bool first_generated = g_mfg_pending && g_mfg_tid == GetCurrentThreadId();
+    const bool same_thread = g_mfg_tid == GetCurrentThreadId();
+    const bool first_generated = g_mfg_pending && same_thread;
     if (first_generated) g_mfg_pending = false;
+    if (!first_generated && g_real_pending && same_thread) {
+        // The real frame: hold it until two thirds of a frame after the first generated one.
+        g_real_pending = false;
+        wait_until(g_real_target_ms);
+        EnterCriticalSection(&g_lock);
+        tl("3x real frame released at ready+%.2f", now_ms() - g_ready_ms);
+        LeaveCriticalSection(&g_lock);
+    }
     const double t0 = now_ms();
     const HRESULT hr = real_Present(self, sync, flags);
     const double t1 = now_ms();
