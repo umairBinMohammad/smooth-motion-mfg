@@ -1,11 +1,8 @@
 @echo off
-rem Records 25 seconds of display timing for GRB.exe with Intel PresentMon.
-rem Put PresentMon-<version>-x64.exe in this tools folder first
-rem (https://github.com/GameTechDev/PresentMon/releases).
-rem Usage: presentmon_capture.cmd <label>     e.g.  presentmon_capture.cmd 2x
+rem Records 75 seconds of display timing for GRB.exe with Intel PresentMon
+rem (PresentMon-<version>-x64.exe in this folder, from
+rem https://github.com/GameTechDev/PresentMon/releases). Output: ..\out\pm_capture.csv
 setlocal
-set LABEL=%1
-if "%LABEL%"=="" set LABEL=capture
 set PM=
 for %%f in ("%~dp0PresentMon-*-x64.exe") do set PM=%%f
 if "%PM%"=="" (
@@ -14,7 +11,5 @@ if "%PM%"=="" (
     exit /b 1
 )
 if not exist "%~dp0..\out" mkdir "%~dp0..\out"
-echo Recording 25 seconds to out\pm_%LABEL%.csv ...
-"%PM%" --process_name GRB.exe --output_file "%~dp0..\out\pm_%LABEL%.csv" --timed 25 --terminate_after_timed --restart_as_admin
-echo Done.
-pause
+echo Recording 75 seconds. Switch to the game now and press F10.
+"%PM%" --process_name GRB.exe --output_file "%~dp0..\out\pm_capture.csv" --v1_metrics --qpc_time --timed 75 --terminate_after_timed --stop_existing_session --restart_as_admin

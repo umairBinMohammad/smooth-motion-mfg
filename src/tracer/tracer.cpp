@@ -81,7 +81,7 @@ uint64_t g_extra_frames = 0, g_extra_skipped = 0;
 bool g_real_pending = false;
 double g_real_target_ms = 0, g_ready_ms = 0;
 
-#define SMM_VERSION "prototype 0.8.1"
+#define SMM_VERSION "prototype 0.8.2"
 
 // ---------------------------------------------------------------- logging
 
@@ -883,16 +883,38 @@ int hook_cuGraphLaunch(CUgraph graph, CUstream stream) {
     g_last_launch_ms = t0;
     if (kTestAction == TestAction::Mfg) {
         const bool mfg_key = (GetAsyncKeyState(kTestKey) & 0x8000) != 0;
+        // F10 starts a measurement sequence: 15 s of stock 2x, 15 s of 3x, then back to 2x.
+        // Phase changes are logged with raw QPC values so a PresentMon capture can be lined up.
+        static double sequence_start = 0;
+        auto qpc_now = []() {
+            LARGE_INTEGER q;
+            QueryPerformanceCounter(&q);
+            return static_cast<long long>(q.QuadPart);
+        };
+        auto set_mode = [&](bool on, const char* why) {
+            g_mfg_on = on;
+            const int upload_rc = upload_scales(on ? 1.0f / 3.0f : 0.5f);
+            logf("3x: %s -> %s qpc=%lld freq=%lld (upload rc=%d, base frame %.2f ms)", why, on ? "ON" : "off", qpc_now(),
+                 static_cast<long long>(g_qpf.QuadPart), upload_rc, g_frame_ms);
+            Beep(on ? 1200 : 500, 80);
+        };
         if (mfg_key && !g_mfg_key_down) {
-            if (g_mfg_ready) {
-                g_mfg_on = !g_mfg_on;
-                const int upload_rc = upload_scales(g_mfg_on ? 1.0f / 3.0f : 0.5f);
-                logf("3x: F10 -> %s (upload rc=%d, base frame %.2f ms)", g_mfg_on ? "ON" : "off", upload_rc, g_frame_ms);
-                g_timeline = 900;
-                Beep(g_mfg_on ? 1200 : 500, 80);
-            } else {
+            if (g_mfg_ready && sequence_start == 0) {
+                sequence_start = t0;
+                logf("3x: sequence start qpc=%lld freq=%lld", qpc_now(), static_cast<long long>(g_qpf.QuadPart));
+                Beep(800, 80);
+            } else if (!g_mfg_ready) {
                 logf("3x: F10 pressed but not ready");
                 Beep(250, 250);
+            }
+        }
+        if (sequence_start > 0) {
+            const double elapsed = t0 - sequence_start;
+            if (elapsed >= 30000.0) {
+                sequence_start = 0;
+                set_mode(false, "sequence end");
+            } else if (elapsed >= 15000.0 && !g_mfg_on && g_mfg_ready) {
+                set_mode(true, "sequence");
             }
         }
         g_mfg_key_down = mfg_key;
@@ -1510,7 +1532,7 @@ DWORD WINAPI bootstrap(void*) {
     AddVectoredExceptionHandler(1, crash_logger);
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    logf("smooth-motion-mfg " SMM_VERSION " in %ls (test key: F10 = 3x on/off)", exe);
+    logf("smooth-motion-mfg " SMM_VERSION " in %ls (test key: F10 = 30 s measurement: 2x, then 3x)", exe);
 
     // NvPresent imports nvcuda.dll by name; loading it first lets us hook its exports
     // before NvPresent makes its first call.

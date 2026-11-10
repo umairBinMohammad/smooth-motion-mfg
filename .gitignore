@@ -4,3 +4,4 @@ out/
 build/
 *.log
 __pycache__/
+tools/PresentMon-*.exe
