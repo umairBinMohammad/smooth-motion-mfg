@@ -81,7 +81,7 @@ uint64_t g_extra_frames = 0, g_extra_skipped = 0;
 bool g_real_pending = false;
 double g_real_target_ms = 0, g_ready_ms = 0;
 
-#define SMM_VERSION "prototype 0.11"
+#define SMM_VERSION "prototype 0.12"
 
 // ---------------------------------------------------------------- logging
 
@@ -845,6 +845,78 @@ int observed_SetFlipConfig(void* a, void* b, void* params, void* d) {
     return rc;
 }
 
+// Generic logging wrappers for the private NVAPI functions NvPresent looks up. The signatures
+// are unknown, so each wrapper forwards eight integer-sized arguments untouched (pointer and
+// handle arguments, and anything on the stack, pass through as-is) and logs them afterwards.
+// Calls to each function are counted, and the first 40, plus any during a timeline, are logged
+// with the first 64 bytes behind every argument that is a readable pointer.
+
+using Nv8 = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+struct NvSlot {
+    uint32_t id;
+    Nv8 real;
+    uint64_t calls;
+};
+NvSlot g_nv_slots[24] = {};
+
+void log_nv_call(int slot, const uint64_t* a, uint64_t result, double took) {
+    NvSlot& s = g_nv_slots[slot];
+    const uint64_t n = s.calls++;
+    const bool full = n < 40;
+    if (!full && g_timeline <= 0 && n % 2000 != 0) return;
+    char line[200];
+    snprintf(line, sizeof(line), "nvapi 0x%08X call %llu tid=%lu ret=0x%llx%.0s args %llx %llx %llx %llx %llx %llx", s.id,
+             static_cast<unsigned long long>(n), GetCurrentThreadId(), static_cast<unsigned long long>(result), "",
+             static_cast<unsigned long long>(a[0]), static_cast<unsigned long long>(a[1]), static_cast<unsigned long long>(a[2]),
+             static_cast<unsigned long long>(a[3]), static_cast<unsigned long long>(a[4]), static_cast<unsigned long long>(a[5]));
+    if (g_timeline > 0) tl("%s", line);
+    if (full || n % 2000 == 0) {
+        logf("%s", line);
+        for (int i = 0; i < 6; ++i) {
+            const void* ptr = reinterpret_cast<const void*>(a[i]);
+            if (a[i] > 0x10000 && a[i] < 0x7fffffff0000ull && (a[i] & 3) == 0 && readable(ptr, 64)) {
+                char text[200];
+                hex(text, sizeof(text), ptr, 64);
+                logf("    arg%d -> %s", i, text);
+            }
+        }
+    }
+}
+
+template <int N>
+uint64_t nv_thunk(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7) {
+    // Call first, before anything that could touch xmm0-3 (a float argument would live there).
+    const uint64_t r = g_nv_slots[N].real(a0, a1, a2, a3, a4, a5, a6, a7);
+    const double took = 0;
+    if (from_nvpresent_quick(__builtin_return_address(0))) {
+        const uint64_t args[8] = {a0, a1, a2, a3, a4, a5, a6, a7};
+        EnterCriticalSection(&g_lock);
+        log_nv_call(N, args, r, took);
+        LeaveCriticalSection(&g_lock);
+    }
+    return r;
+}
+
+const Nv8 kNvThunks[24] = {&nv_thunk<0>, &nv_thunk<1>, &nv_thunk<2>, &nv_thunk<3>, &nv_thunk<4>, &nv_thunk<5>,
+                           &nv_thunk<6>, &nv_thunk<7>, &nv_thunk<8>, &nv_thunk<9>, &nv_thunk<10>, &nv_thunk<11>,
+                           &nv_thunk<12>, &nv_thunk<13>, &nv_thunk<14>, &nv_thunk<15>, &nv_thunk<16>, &nv_thunk<17>,
+                           &nv_thunk<18>, &nv_thunk<19>, &nv_thunk<20>, &nv_thunk<21>, &nv_thunk<22>, &nv_thunk<23>};
+
+// Called with g_lock held. Returns the wrapper to hand back to NvPresent, or nullptr.
+void* wrap_nvapi(uint32_t id, void* real) {
+    // NvAPI_Initialize / NvAPI_Unload: not per-frame, leave alone.
+    if (!real || id == 0x0150E828u || id == 0xD22BDD7Eu || id == 0xF3148C42u) return nullptr;
+    for (int i = 0; i < 24; ++i) {
+        if (g_nv_slots[i].id == id) return reinterpret_cast<void*>(g_nv_slots[i].real == reinterpret_cast<Nv8>(real) ? kNvThunks[i] : nullptr);
+        if (!g_nv_slots[i].id) {
+            g_nv_slots[i].id = id;
+            g_nv_slots[i].real = reinterpret_cast<Nv8>(real);
+            return reinterpret_cast<void*>(kNvThunks[i]);
+        }
+    }
+    return nullptr;
+}
+
 void* hook_nvapi_QueryInterface(uint32_t id) {
     void* result = real_nvapi_QueryInterface(id);
     if (!from_nvpresent_quick(__builtin_return_address(0))) return result;
@@ -858,7 +930,9 @@ void* hook_nvapi_QueryInterface(uint32_t id) {
         logf("nvapi interface 0x%08X -> %p%s", id, result,
              id == 0xF3148C42u ? " (SetFlipConfig)" : id == 0x6194B19Du ? " (flip-config caps)" : "");
     }
+    void* wrapper = wrap_nvapi(id, result);
     LeaveCriticalSection(&g_lock);
+    if (wrapper) return wrapper;
     if (id == 0xF3148C42u && result) {
         real_SetFlipConfig = reinterpret_cast<decltype(real_SetFlipConfig)>(result);
         return reinterpret_cast<void*>(&observed_SetFlipConfig);
