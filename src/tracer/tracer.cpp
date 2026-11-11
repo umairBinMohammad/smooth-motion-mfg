@@ -81,7 +81,7 @@ uint64_t g_extra_frames = 0, g_extra_skipped = 0;
 bool g_real_pending = false;
 double g_real_target_ms = 0, g_ready_ms = 0;
 
-#define SMM_VERSION "prototype 0.10"
+#define SMM_VERSION "prototype 0.11"
 
 // ---------------------------------------------------------------- logging
 
@@ -1272,6 +1272,95 @@ bool gate_setup(ID3D11Device* device_b) {
     return !g_gate_failed;
 }
 
+// ---------------------------------------------------------------- present pacer
+//
+// 0.10 showed that holding presents with GPU fence waits keeps the spacing even but stalls the
+// game's next frame behind the wait (base frame 37 -> 53 ms, no net gain). 0.11 instead hands
+// our generated frame and the real frame's Present to a pacer thread, which issues them at
+// ready + T/3 and ready + 2T/3. The game thread never waits, and nothing is queued on the GPU
+// ahead of the game's next frame. NvPresent's device is switched to multithread protection so
+// the pacer can use it while the game thread does.
+
+struct PacerJob {
+    void* swapchain;
+    UINT sync, flags;
+    ID3D11Texture2D* back;
+    ID3D11DeviceContext* context;
+    double first, second, ready;
+};
+PacerJob g_job = {};
+HANDLE g_pacer_start = nullptr, g_pacer_done = nullptr, g_real_arrived = nullptr;
+ID3D11Multithread* g_mt = nullptr;
+ID3D11Device* g_pacer_device = nullptr;
+bool g_pacer_failed = false;
+UINT g_real_sync = 0, g_real_flags = 0;
+uint64_t g_pacer_count = 0, g_real_missing = 0;
+
+DWORD WINAPI pacer_thread(void*) {
+    for (;;) {
+        WaitForSingleObject(g_pacer_start, INFINITE);
+        PacerJob job = g_job;
+        const double cap = now_ms() + 120.0;
+        wait_until(job.first < cap ? job.first : cap);
+        g_mt->Enter();
+        const double t_copy = now_ms();
+        job.context->CopyResource(job.back, static_cast<ID3D11Texture2D*>(g_out_texture));
+        const HRESULT hr1 = real_Present(job.swapchain, job.sync, job.flags);
+        g_mt->Leave();
+        const double t_first = now_ms();
+        // The real frame's Present has normally been handed over long before this point.
+        const DWORD arrived = WaitForSingleObject(g_real_arrived, 60);
+        HRESULT hr2 = S_FALSE;
+        double t_second = 0;
+        if (arrived == WAIT_OBJECT_0) {
+            wait_until(job.second < cap ? job.second : cap);
+            g_mt->Enter();
+            hr2 = real_Present(job.swapchain, g_real_sync, g_real_flags);
+            g_mt->Leave();
+            t_second = now_ms();
+        }
+        job.back->Release();
+        job.context->Release();
+        EnterCriticalSection(&g_lock);
+        if (arrived != WAIT_OBJECT_0) ++g_real_missing;
+        if (g_pacer_count++ < 15 || g_pacer_count % 600 == 0 || FAILED(hr1) || FAILED(hr2) || arrived != WAIT_OBJECT_0)
+            logf("3x pacer: generated at ready+%.2f (target %.2f, hr=0x%lx), real at ready+%.2f (target %.2f, hr=0x%lx%s)",
+                 t_first - job.ready, job.first - job.ready, hr1, t_second ? t_second - job.ready : -1.0, job.second - job.ready,
+                 hr2, arrived == WAIT_OBJECT_0 ? "" : ", real frame never arrived");
+        tl("3x pacer: generated presented at ready+%.2f (copy at +%.2f), real at ready+%.2f", t_first - job.ready, t_copy - job.ready,
+           t_second ? t_second - job.ready : -1.0);
+        LeaveCriticalSection(&g_lock);
+        SetEvent(g_pacer_done);
+    }
+}
+
+bool pacer_setup(ID3D11Device* device) {
+    if (g_pacer_failed) return false;
+    if (g_pacer_device == device) return true;
+    if (g_pacer_device) {  // NvPresent recreated its device: not handled by this prototype
+        g_pacer_failed = true;
+        return false;
+    }
+    g_pacer_device = device;
+    HRESULT hr = device->QueryInterface(__uuidof(ID3D11Multithread), reinterpret_cast<void**>(&g_mt));
+    BOOL was = FALSE;
+    if (SUCCEEDED(hr)) was = g_mt->SetMultithreadProtected(TRUE);
+    g_pacer_start = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_pacer_done = CreateEventW(nullptr, TRUE, TRUE, nullptr);
+    g_real_arrived = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    HANDLE thread = nullptr;
+    if (SUCCEEDED(hr) && g_pacer_start && g_pacer_done && g_real_arrived) thread = CreateThread(nullptr, 0, pacer_thread, nullptr, 0, nullptr);
+    if (thread) {
+        SetThreadPriority(thread, THREAD_PRIORITY_TIME_CRITICAL);
+        CloseHandle(thread);
+    }
+    g_pacer_failed = !thread;
+    EnterCriticalSection(&g_lock);
+    logf("3x pacer: setup %s (multithread protection was %s, hr=0x%lx)", g_pacer_failed ? "FAILED" : "ok", was ? "on" : "off", hr);
+    LeaveCriticalSection(&g_lock);
+    return !g_pacer_failed;
+}
+
 // 3x: called right after NvPresent presented its generated frame (built for t = 1/3).
 // Builds the t = 2/3 frame with NVIDIA's own warp kernel into the same texture, copies it
 // into the back buffer and presents it. NvPresent then presents the real frame as usual.
@@ -1317,22 +1406,24 @@ void present_second_generated_frame(void* self, UINT sync, UINT flags, double fi
         t_cuda = now_ms();
         if (scale_rc == 0 && warp_rc == 0 && sync_rc == 0) {
             device->GetImmediateContext(&context);
-            const bool gated = gate_setup(device);
-            UINT64 first_value = 0;
-            if (gated) {
-                first_value = ++g_gate_value;
-                g_real_gate_value = ++g_gate_value;
-                gated_ok = SUCCEEDED(g_gate_context_b->Wait(g_gate_fence_b, first_value));
-            }
-            context->CopyResource(back, static_cast<ID3D11Texture2D*>(g_out_texture));
-            hr = real_Present(self, sync, flags);
-            if (gated) {
-                g_gate_job_target_first = ready + frame / 3.0;
-                g_gate_job_target = ready + 2.0 * frame / 3.0;
-                g_real_target_ms = g_gate_job_target;
-                InterlockedExchange64(&g_gate_job_value, static_cast<LONG64>(g_real_gate_value));
-                SetEvent(g_gate_event);
+            if (pacer_setup(device)) {
+                g_job.swapchain = self;
+                g_job.sync = sync;
+                g_job.flags = flags;
+                g_job.back = back;
+                back->AddRef();
+                g_job.context = context;
+                context->AddRef();
+                g_job.ready = ready;
+                g_job.first = ready + frame / 3.0;
+                g_job.second = ready + 2.0 * frame / 3.0;
+                ResetEvent(g_pacer_done);
                 g_real_pending = true;
+                SetEvent(g_pacer_start);
+                hr = S_OK;
+            } else {
+                context->CopyResource(back, static_cast<ID3D11Texture2D*>(g_out_texture));
+                hr = real_Present(self, sync, flags);
             }
             t_done = now_ms();
             g_extra_cost_ms = 0.9 * g_extra_cost_ms + 0.1 * (t_cuda - t_start + 0.5);
@@ -1369,16 +1460,25 @@ HRESULT hook_Present(void* self, UINT sync, UINT flags) {
     const bool same_thread = g_mfg_tid == GetCurrentThreadId();
     const bool first_generated = g_mfg_pending && same_thread;
     if (first_generated) g_mfg_pending = false;
-    if (!first_generated && g_real_pending && same_thread) {
-        // The real frame: queue a GPU-side wait in front of its present, and let the pacer
-        // thread open it at ready + 2/3 frame. Nothing waits on this thread.
-        g_real_pending = false;
-        const UINT64 value = g_real_gate_value;
-        const HRESULT wait_hr = g_gate_context_b->Wait(g_gate_fence_b, value);
+    if (first_generated && g_pacer_done && WaitForSingleObject(g_pacer_done, 0) != WAIT_OBJECT_0) {
+        // The previous frame's paced presents are still outstanding; they must reach the
+        // swapchain before NvPresent's next one. Rare: it means the base frame got much shorter.
+        const double w0 = now_ms();
+        WaitForSingleObject(g_pacer_done, 150);
         EnterCriticalSection(&g_lock);
-        if (FAILED(wait_hr)) logf("3x gate: Wait failed hr=0x%lx", wait_hr);
-        tl("3x real frame gated (value %llu) until ready+%.2f", static_cast<unsigned long long>(value), g_real_target_ms - g_ready_ms);
+        tl("3x: generated present waited %.2f ms for the pacer", now_ms() - w0);
         LeaveCriticalSection(&g_lock);
+    }
+    if (!first_generated && g_real_pending && same_thread) {
+        // The real frame: hand its Present to the pacer thread and return at once.
+        g_real_pending = false;
+        g_real_sync = sync;
+        g_real_flags = flags;
+        SetEvent(g_real_arrived);
+        EnterCriticalSection(&g_lock);
+        tl("3x real frame handed to pacer");
+        LeaveCriticalSection(&g_lock);
+        return S_OK;
     }
     const double t0 = now_ms();
     const HRESULT hr = real_Present(self, sync, flags);
