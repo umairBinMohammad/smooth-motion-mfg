@@ -81,7 +81,7 @@ uint64_t g_extra_frames = 0, g_extra_skipped = 0;
 bool g_real_pending = false;
 double g_real_target_ms = 0, g_ready_ms = 0;
 
-#define SMM_VERSION "prototype 0.9"
+#define SMM_VERSION "prototype 0.10"
 
 // ---------------------------------------------------------------- logging
 
@@ -1163,8 +1163,9 @@ ID3D11Fence* g_gate_fence_c = nullptr;
 bool g_gate_failed = false;
 UINT64 g_gate_value = 0;
 HANDLE g_gate_event = nullptr;
-volatile LONG64 g_gate_job_value = 0;
-double g_gate_job_target = 0;
+volatile LONG64 g_gate_job_value = 0;  // value of the real frame's gate; value - 1 is the second generated frame's
+double g_gate_job_target = 0, g_gate_job_target_first = 0;
+UINT64 g_real_gate_value = 0;
 uint64_t g_gate_count = 0;
 
 DWORD WINAPI gate_thread(void*) {
@@ -1173,15 +1174,22 @@ DWORD WINAPI gate_thread(void*) {
         WaitForSingleObject(g_gate_event, INFINITE);
         const UINT64 value = static_cast<UINT64>(InterlockedCompareExchange64(&g_gate_job_value, 0, 0));
         if (value <= signalled) continue;
-        double target = g_gate_job_target;
-        const double now = now_ms();
-        if (target > now + 120.0) target = now + 120.0;  // never hold the display hostage
+        const double cap = now_ms() + 120.0;  // never hold the display hostage
+        double first = g_gate_job_target_first, target = g_gate_job_target;
+        if (first > cap) first = cap;
+        if (target > cap) target = cap;
+        wait_until(first);
+        g_gate_context_c->Signal(g_gate_fence_c, value - 1);
+        g_gate_context_c->Flush();
+        const double first_done = now_ms();
         wait_until(target);
         const HRESULT hr = g_gate_context_c->Signal(g_gate_fence_c, value);
         g_gate_context_c->Flush();
         signalled = value;
         EnterCriticalSection(&g_lock);
-        if (g_gate_count++ < 12 || FAILED(hr)) logf("3x gate: signalled %llu at ready+%.2f hr=0x%lx", static_cast<unsigned long long>(value), now_ms() - g_ready_ms, hr);
+        if (g_gate_count++ < 12 || FAILED(hr))
+            logf("3x gate: second generated released at ready+%.2f, real at ready+%.2f (value %llu) hr=0x%lx", first_done - g_ready_ms,
+                 now_ms() - g_ready_ms, static_cast<unsigned long long>(value), hr);
         tl("3x gate opened (real frame may flip) at ready+%.2f", now_ms() - g_ready_ms);
         LeaveCriticalSection(&g_lock);
     }
@@ -1214,6 +1222,20 @@ bool gate_setup(ID3D11Device* device_b) {
         if (FAILED(hr = context_b->QueryInterface(__uuidof(ID3D11DeviceContext4), reinterpret_cast<void**>(&g_gate_context_b)))) break;
         step = "adapter";
         if (FAILED(hr = device_b->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&dxgi)))) break;
+        {
+            // Present blocks while the previous present is still pending; with gated presents that
+            // would stall the game thread. Allow a few queued frames on NvPresent's device.
+            IDXGIDevice1* dxgi1 = nullptr;
+            if (SUCCEEDED(device_b->QueryInterface(__uuidof(IDXGIDevice1), reinterpret_cast<void**>(&dxgi1)))) {
+                UINT before = 0;
+                dxgi1->GetMaximumFrameLatency(&before);
+                const HRESULT latency_hr = dxgi1->SetMaximumFrameLatency(4);
+                EnterCriticalSection(&g_lock);
+                logf("3x gate: maximum frame latency was %u, set to 4 (hr=0x%lx)", before, latency_hr);
+                LeaveCriticalSection(&g_lock);
+                dxgi1->Release();
+            }
+        }
         if (FAILED(hr = dxgi->GetAdapter(&adapter))) break;
         step = "D3D11CreateDevice (C)";
         using CreateFn = HRESULT(WINAPI*)(IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE, UINT, const D3D_FEATURE_LEVEL*, UINT, UINT,
@@ -1274,6 +1296,7 @@ void present_second_generated_frame(void* self, UINT sync, UINT flags, double fi
             skip = "back buffer and generated texture differ";
     }
     double ready = 0;
+    bool gated_ok = false;
     const double frame = g_frame_ms > 4.0 ? g_frame_ms : 33.0;
     if (!skip) {
         // The first generated frame can only be shown once the graph has finished on the GPU.
@@ -1294,15 +1317,27 @@ void present_second_generated_frame(void* self, UINT sync, UINT flags, double fi
         t_cuda = now_ms();
         if (scale_rc == 0 && warp_rc == 0 && sync_rc == 0) {
             device->GetImmediateContext(&context);
+            const bool gated = gate_setup(device);
+            UINT64 first_value = 0;
+            if (gated) {
+                first_value = ++g_gate_value;
+                g_real_gate_value = ++g_gate_value;
+                gated_ok = SUCCEEDED(g_gate_context_b->Wait(g_gate_fence_b, first_value));
+            }
             context->CopyResource(back, static_cast<ID3D11Texture2D*>(g_out_texture));
             hr = real_Present(self, sync, flags);
+            if (gated) {
+                g_gate_job_target_first = ready + frame / 3.0;
+                g_gate_job_target = ready + 2.0 * frame / 3.0;
+                g_real_target_ms = g_gate_job_target;
+                InterlockedExchange64(&g_gate_job_value, static_cast<LONG64>(g_real_gate_value));
+                SetEvent(g_gate_event);
+                g_real_pending = true;
+            }
             t_done = now_ms();
             g_extra_cost_ms = 0.9 * g_extra_cost_ms + 0.1 * (t_cuda - t_start + 0.5);
             if (g_extra_cost_ms > frame / 3.0) g_extra_cost_ms = frame / 3.0;
-            if (gate_setup(device)) {
-                g_real_target_ms = ready + 2.0 * frame / 3.0;
-                g_real_pending = true;
-            }
+            (void)gated_ok;
         } else {
             skip = "CUDA launch failed";
         }
@@ -1338,13 +1373,8 @@ HRESULT hook_Present(void* self, UINT sync, UINT flags) {
         // The real frame: queue a GPU-side wait in front of its present, and let the pacer
         // thread open it at ready + 2/3 frame. Nothing waits on this thread.
         g_real_pending = false;
-        const UINT64 value = ++g_gate_value;
+        const UINT64 value = g_real_gate_value;
         const HRESULT wait_hr = g_gate_context_b->Wait(g_gate_fence_b, value);
-        if (SUCCEEDED(wait_hr)) {
-            g_gate_job_target = g_real_target_ms;
-            InterlockedExchange64(&g_gate_job_value, static_cast<LONG64>(value));
-            SetEvent(g_gate_event);
-        }
         EnterCriticalSection(&g_lock);
         if (FAILED(wait_hr)) logf("3x gate: Wait failed hr=0x%lx", wait_hr);
         tl("3x real frame gated (value %llu) until ready+%.2f", static_cast<unsigned long long>(value), g_real_target_ms - g_ready_ms);
